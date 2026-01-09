@@ -8,5 +8,10 @@ agent/sessions/
 # Cached data
 agent/cache/
 
+# Symlinked extensions
+agent/extensions/task
+
 # Dependencies
 node_modules/
+
+.DS_Store
