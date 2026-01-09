@@ -1,0 +1,12 @@
+# Credentials and tokens
+agent/auth.json
+agent/oauth.json*
+
+# Local session history
+agent/sessions/
+
+# Cached data
+agent/cache/
+
+# Dependencies
+node_modules/

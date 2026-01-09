@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Exa Content Fetch Script
+# Fetches page content using the Exa API
+
+set -e
+
+EXA_API_KEY_FILE="$HOME/.api-keys/exa"
+
+usage() {
+    cat <<EOF
+Usage: exa-fetch [OPTIONS] URL...
+
+Fetch web page content using the Exa API.
+
+Arguments:
+  URL...      One or more URLs to fetch content from
+
+Options:
+  --help      Show this help message
+
+Examples:
+  exa-fetch https://example.com/page.html
+  exa-fetch https://docs.example.com/api https://docs.example.com/guide
+
+Environment:
+  API key is read from: $EXA_API_KEY_FILE
+EOF
+    exit 0
+}
+
+# Parse arguments
+URLS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help)
+            usage
+            ;;
+        *)
+            URLS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Check for URLs
+if [[ ${#URLS[@]} -eq 0 ]]; then
+    echo "Error: No URLs provided" >&2
+    echo "Use --help for usage information" >&2
+    exit 1
+fi
+
+# Check for API key
+if [[ ! -f "$EXA_API_KEY_FILE" ]]; then
+    echo "Error: API key file not found at $EXA_API_KEY_FILE" >&2
+    exit 1
+fi
+
+API_KEY=$(cat "$EXA_API_KEY_FILE")
+
+# Build JSON array of URLs
+IDS_JSON=$(printf '%s\n' "${URLS[@]}" | jq -R . | jq -s .)
+
+# Make request and format output
+curl -s -X POST "https://api.exa.ai/contents" \
+  --header "content-type: application/json" \
+  --header "x-api-key: $API_KEY" \
+  --data "$(jq -n --argjson ids "$IDS_JSON" '{ids: $ids, text: true}')" | jq -r '
+  if .error then
+    "Error: " + (.error // "Unknown error")
+  else
+    (.results // [] | map(
+      .url + "\n\n# " + .title + "\n\n" + .text
+    ) | join("\n\n---\n\n"))
+  end
+'

@@ -1,0 +1,104 @@
+#!/bin/bash
+
+# Kagi Web Search Script
+# Searches the web using the Kagi API
+
+set -e
+
+KAGI_API_KEY_FILE="$HOME/.api-keys/kagi"
+
+usage() {
+    cat <<EOF
+Usage: kagi-search [OPTIONS] QUERY...
+
+Search the web using the Kagi API.
+
+Arguments:
+  QUERY...    Search terms (will be URL-encoded automatically)
+
+Options:
+  --limit N   Limit the number of results (default: no limit)
+  --help      Show this help message
+
+Examples:
+  kagi-search clojure repl development
+  kagi-search --limit 5 intellij plugin kotlin
+  kagi-search "exact phrase" other words
+
+Environment:
+  API key is read from: $KAGI_API_KEY_FILE
+EOF
+    exit 0
+}
+
+# Parse arguments
+LIMIT=""
+QUERY_WORDS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help)
+            usage
+            ;;
+        --limit)
+            if [[ -z "$2" || "$2" == --* ]]; then
+                echo "Error: --limit requires a number" >&2
+                exit 1
+            fi
+            LIMIT="$2"
+            shift 2
+            ;;
+        *)
+            QUERY_WORDS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Check for query
+if [[ ${#QUERY_WORDS[@]} -eq 0 ]]; then
+    echo "Error: No search query provided" >&2
+    echo "Use --help for usage information" >&2
+    exit 1
+fi
+
+# Check for API key
+if [[ ! -f "$KAGI_API_KEY_FILE" ]]; then
+    echo "Error: API key file not found at $KAGI_API_KEY_FILE" >&2
+    exit 1
+fi
+
+TOKEN=$(cat "$KAGI_API_KEY_FILE")
+
+# URL-encode the query
+url_encode() {
+    local string="$1"
+    python3 -c "import urllib.parse; print(urllib.parse.quote('''$string'''))"
+}
+
+# Join query words and encode
+QUERY="${QUERY_WORDS[*]}"
+ENCODED_QUERY=$(url_encode "$QUERY")
+
+# Build URL
+URL="https://kagi.com/api/v0/search?q=$ENCODED_QUERY"
+if [[ -n "$LIMIT" ]]; then
+    URL="$URL&limit=$LIMIT"
+fi
+
+# Make request and format output
+curl -s -H "Authorization: Bot $TOKEN" "$URL" | jq -r '
+  if .error then
+    "Error: " + (.error[0].msg // "Unknown error")
+  else
+    (.data // [] | map(
+      if .t == 0 then
+        "## " + .title + "\n" + .url + "\n" + (.snippet // "") + "\n"
+      elif .t == 1 then
+        "## Related Searches\n" + (.list | map("- " + .) | join("\n"))
+      else
+        empty
+      end
+    ) | join("\n"))
+  end
+'

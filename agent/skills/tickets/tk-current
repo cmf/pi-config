@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# tk-current - Show the current in-progress ticket for a task workspace
+#
+# Requires: jj, tk, jq
+#
+# Usage: tk-current
+#
+# Must be run from within a jj workspace under ~/.workspaces.
+# Expects exactly one ticket with status "in_progress".
+
+set -euo pipefail
+
+# Check we're in a jj repo
+if ! jj_root=$(jj root 2>/dev/null); then
+    echo "Error: not in a jj repository" >&2
+    exit 1
+fi
+
+# Check the workspace is under ~/.workspaces
+workspaces_dir="$HOME/.workspaces"
+if [[ "$jj_root" != "$workspaces_dir"* ]]; then
+    echo "Error: not in a task workspace (must be under $workspaces_dir)" >&2
+    exit 1
+fi
+
+# Find in-progress tickets
+tickets_json=$(tk query 'select(.status=="in_progress")' 2>/dev/null) || true
+
+if [[ -z "$tickets_json" ]]; then
+    echo "Error: no in-progress tickets found" >&2
+    exit 1
+fi
+
+# Count tickets
+ticket_count=$(echo "$tickets_json" | wc -l | tr -d ' ')
+
+if [[ "$ticket_count" -gt 1 ]]; then
+    echo "Error: multiple in-progress tickets found ($ticket_count), expected exactly one:" >&2
+    echo "$tickets_json" | jq -r '.id' >&2
+    exit 1
+fi
+
+# Get the ticket ID
+ticket_id=$(echo "$tickets_json" | jq -r '.id')
+
+if [[ -z "$ticket_id" || "$ticket_id" == "null" ]]; then
+    echo "Error: could not extract ticket ID" >&2
+    exit 1
+fi
+
+# Output the ticket file path
+ticket_file=".tickets/${ticket_id}.md"
+if [[ ! -f "$ticket_file" ]]; then
+    echo "Error: ticket file not found: $ticket_file" >&2
+    exit 1
+fi
+
+echo "$jj_root/$ticket_file"
