@@ -13,7 +13,7 @@ Help turn ideas into fully formed designs and specs through natural collaborativ
 
 Start by understanding the current project context, then ask questions one at a time to refine the idea. Once you understand what you're building, present the design in small sections (200-300 words), checking after each section whether it looks right so far.
 
-When asking the user for details, use the query tools: confirm, select, multi_select, input, and editor.
+When asking the user for details, use the free-form input tools: input, and editor. This allows the user to either select an option using its number if you have presented multi-choice options, or enter some other option altogether.
 
 ## The Process
 

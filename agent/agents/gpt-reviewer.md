@@ -2,7 +2,7 @@
 name: gpt-reviewer
 description: Code and plan review specialist using GPT-5.2 codex
 tools: read, grep, find, ls, bash
-model: gpt-5.2-codex
+model: gpt-5.1-codex-max
 thinking: xhigh
 ---
 

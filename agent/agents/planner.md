@@ -16,6 +16,11 @@ Write comprehensive implementation plans assuming the engineer has zero context 
 
 Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
 
+**YAGNI:**
+- We highly value the minimum required change to work
+- Is the solution the simplest thing?
+- Can it be simplified further?
+
 ## Bite-Sized Task Granularity
 
 **Each step is one action (2-5 minutes):**

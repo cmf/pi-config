@@ -11,10 +11,10 @@ Run `tk help` for the full command reference.
 
 ## Task Workspaces
 
-When working in a jj task workspace (under `~/.workspaces`), use `tk-current` to view the current ticket:
+When working in a jj task workspace (under `~/.workspaces`), use `tk-current` to view the current ticket, it lives alongside this skill:
 
 ```bash
-tk-current    # Outputs the full path to the in-progress ticket file
+~/.pi/agent/skills/tickets/tk-current    # Outputs the full path to the in-progress ticket file
 ```
 
 This verifies you're in a valid task workspace and that exactly one ticket is in progress. Use the path to read or update the ticket file as you work.

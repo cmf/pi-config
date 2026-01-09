@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose subagent with full capabilities, isolated context
-model: gpt-5.2-codex
+model: claude-opus-4-5
 thinking: medium
 ---
 
