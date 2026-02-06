@@ -1,0 +1,621 @@
+import {parseFrontmatter} from "@mariozechner/pi-coding-agent";
+
+/**
+ * Exploratory v2 model:
+ * - single assistant-turn completion event
+ * - parsing assistant output inside the functional core
+ * - plan subtasks sourced from root ticket markdown (parity with index.ts)
+ * - simpler, generic effect model (idempotent CREATE_TICKET)
+ *
+ * This file is still a model only (not wired into index.ts yet).
+ */
+
+export type WorkflowState =
+    | "refine"
+    | "plan"
+    | "review-plan"
+    | "implement"
+    | "review"
+    | "implement-review"
+    | "subtask-commit"
+    | "manual-test"
+    | "commit"
+    | "complete";
+
+export type WorkflowEvent =
+    | {
+    type: "COMPLETE";
+    completedState: WorkflowState;
+    rootTicketMarkdown: string;
+    assistantMessage: string;
+}
+    | {
+    type: "FORCE_LGTM";
+    completedState: WorkflowState;
+    /**
+     * Root ticket markdown at time of force. Required in review-plan.
+     */
+    rootTicketMarkdown?: string;
+}
+    | {
+    type: "MANUAL_TESTS_PASSED";
+};
+
+export type WorkflowEffect =
+    | {
+    type: "CREATE_TICKET";
+    parentTaskId: string;
+    title: string;
+    description: string;
+    /**
+     * Idempotency key used by the shell/interpreter to avoid duplicate tickets.
+     * Suggested semantics: unique on (parentTaskId, title).
+     */
+    idempotencyKey: string;
+}
+    | {
+    type: "ADD_NOTE";
+    taskId: string;
+    note: string;
+}
+    | {
+    type: "CLOSE_TICKET";
+    taskId: string;
+}
+    | {
+    type: "RUN_JJ_COMMIT";
+    message: string;
+};
+
+export type ActiveTaskTarget =
+    | { type: "current" }
+    | { type: "root" }
+    | { type: "parent" }
+    | { type: "next-sibling" }
+    | { type: "first-created-child"; parentTaskId: string };
+
+export type TicketDraft = {
+    title: string;
+    description: string;
+    tdd: boolean;
+};
+
+/**
+ * Minimal context the pure machine needs to make deterministic decisions.
+ *
+ * Notes:
+ * - activeTaskParentId / activeTaskNextSiblingId are derived by the shell from the current workflow tree.
+ */
+export interface WorkflowSnapshot {
+    state: WorkflowState;
+    rootTaskId: string;
+    activeTaskId: string;
+    activeTaskParentId: string | null;
+    activeTaskNextSiblingId: string | null;
+}
+
+/**
+ * Outcome model for callers:
+ * - applied: valid transition accepted (including state stays with side effects)
+ * - ignored: valid no-op (e.g. interactive turn with no transition tag yet)
+ * - rejected: invalid event/state combination or malformed required payload
+ */
+export type AppliedTransitionDecision = {
+    kind: "applied";
+    state: WorkflowState;
+    activeTaskTarget: ActiveTaskTarget;
+    effects: WorkflowEffect[];
+    reason?: string;
+};
+
+export type IgnoredTransitionDecision = {
+    kind: "ignored";
+    state: WorkflowState;
+    activeTaskTarget: ActiveTaskTarget;
+    effects: WorkflowEffect[];
+    reason?: string;
+};
+
+export type RejectedTransitionDecision = {
+    kind: "rejected";
+    state: WorkflowState;
+    activeTaskTarget: ActiveTaskTarget;
+    effects: WorkflowEffect[];
+    reason: string;
+};
+
+export type TransitionDecision =
+    | AppliedTransitionDecision
+    | IgnoredTransitionDecision
+    | RejectedTransitionDecision;
+
+export interface ParsedAssistantOutput {
+    requestedState: WorkflowState | null;
+    reviewFindings: TicketDraft[];
+    commitMessage: string | null;
+}
+
+export type ParsedAssistantOutputResult =
+    | { parsed: ParsedAssistantOutput }
+    | { error: string };
+
+export function parseAssistantOutput(
+    message: string,
+    state?: WorkflowState,
+): ParsedAssistantOutputResult {
+    const shouldParseReviewFindings = state === undefined || state === "review";
+    const reviewFindingsResult = shouldParseReviewFindings
+        ? parseTicketDraftListFromTag(message, "review-findings")
+        : null;
+
+    if (reviewFindingsResult && "error" in reviewFindingsResult) {
+        return {error: reviewFindingsResult.error};
+    }
+
+    return {
+        parsed: {
+            requestedState: parseRequestedStateFromAssistantMessage(message),
+            reviewFindings: reviewFindingsResult ? reviewFindingsResult.drafts : [],
+            commitMessage: parseCommitMessageFromAssistantMessage(message),
+        },
+    };
+}
+
+export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): TransitionDecision {
+    if (event.type === "MANUAL_TESTS_PASSED") {
+        switch (snapshot.state) {
+            case "manual-test":
+                return move(snapshot, "commit", {type: "root"});
+
+            default:
+                return error(snapshot, event, "Manual tests can only pass in manual-test state");
+        }
+    }
+
+    if (event.type === "FORCE_LGTM") {
+        if (event.completedState !== snapshot.state) {
+            return error(snapshot, event, "Stale FORCE_LGTM event for a different state");
+        }
+
+        switch (snapshot.state) {
+            case "review-plan": {
+                const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                if ("error" in planSubtasksResult) {
+                    return error(snapshot, event, `Cannot force approval: ${planSubtasksResult.error}`);
+                }
+
+                if (planSubtasksResult.drafts.length === 0) {
+                    return error(snapshot, event, "Cannot force approval: no plan subtasks found in root ticket markdown");
+                }
+
+                return move(
+                    snapshot,
+                    "implement",
+                    {type: "first-created-child", parentTaskId: snapshot.rootTaskId},
+                    [
+                        ...toCreateTicketEffects(snapshot.rootTaskId, planSubtasksResult.drafts),
+                        {
+                            type: "ADD_NOTE",
+                            taskId: snapshot.activeTaskId,
+                            note: "Forced LGTM via /task lgtm (skipping plan review findings).",
+                        },
+                    ],
+                );
+            }
+
+            case "review":
+                return move(snapshot, "subtask-commit", {type: "current"}, [
+                    {
+                        type: "ADD_NOTE",
+                        taskId: snapshot.activeTaskId,
+                        note: "Forced LGTM via /task lgtm (skipping review findings).",
+                    },
+                ]);
+
+            default:
+                return error(snapshot, event, "FORCE_LGTM is only valid in review-plan or review");
+        }
+    }
+
+    // COMPLETE event
+    if (event.completedState !== snapshot.state) {
+        return error(snapshot, event, "Stale COMPLETE event for a different state");
+    }
+
+    const parsedResult = parseAssistantOutput(event.assistantMessage, snapshot.state);
+    if ("error" in parsedResult) {
+        return error(snapshot, event, parsedResult.error);
+    }
+
+    const parsed = parsedResult.parsed;
+
+    switch (snapshot.state) {
+        case "refine": {
+            switch (parsed.requestedState) {
+                case null:
+                    return ignored(snapshot, event) // Interactive turns
+                case "plan":
+                    return move(snapshot, "plan", {type: "root"});
+                default:
+                    return error(snapshot, event, "Expected <transition>plan</transition>");
+            }
+        }
+
+        case "plan": {
+            switch (parsed.requestedState) {
+                case null:
+                    return ignored(snapshot, event) // Interactive turns
+                case "review-plan": {
+                    const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                    if ("error" in planSubtasksResult) {
+                        return error(snapshot, event, `Cannot move to review-plan: ${planSubtasksResult.error}`);
+                    }
+
+                    if (planSubtasksResult.drafts.length === 0) {
+                        return error(
+                            snapshot,
+                            event,
+                            "Expected non-empty ## Plan/<subtasks>...</subtasks> in root ticket before moving to review-plan",
+                        );
+                    }
+
+                    return move(snapshot, "review-plan", {type: "root"});
+                }
+                default:
+                    return error(snapshot, event, "Expected <transition>review-plan</transition>");
+            }
+        }
+
+        case "review-plan": {
+            switch (parsed.requestedState) {
+                case "review-plan": {
+                    const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                    if ("error" in planSubtasksResult) {
+                        return error(snapshot, event, `Cannot re-review: ${planSubtasksResult.error}`);
+                    }
+
+                    if (planSubtasksResult.drafts.length === 0) {
+                        return error(snapshot, event, "Cannot re-review: no plan subtasks found in root ticket markdown");
+                    }
+                    return stay(snapshot);
+                }
+
+                case "implement": {
+                    const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                    if ("error" in planSubtasksResult) {
+                        return error(snapshot, event, `Cannot approve plan: ${planSubtasksResult.error}`);
+                    }
+
+                    if (planSubtasksResult.drafts.length === 0) {
+                        return error(snapshot, event, "Cannot approve plan: no plan subtasks found in root ticket markdown");
+                    }
+
+                    return move(
+                        snapshot,
+                        "implement",
+                        {type: "first-created-child", parentTaskId: snapshot.rootTaskId},
+                        toCreateTicketEffects(snapshot.rootTaskId, planSubtasksResult.drafts),
+                    );
+                }
+
+                default:
+                    return error(
+                        snapshot,
+                        event,
+                        "Expected <transition>implement</transition> or <transition>review-plan</transition>",
+                    );
+            }
+        }
+
+        case "implement": {
+            return move(snapshot, "review", {type: "current"});
+        }
+
+        case "review": {
+            switch (parsed.requestedState) {
+                case "subtask-commit":
+                    return move(snapshot, "subtask-commit", {type: "current"});
+
+                case "implement-review": {
+                    if (parsed.reviewFindings.length === 0) {
+                        return error(
+                            snapshot,
+                            event,
+                            "Got <transition>implement-review</transition> but no <review-findings> block",
+                        );
+                    }
+
+                    return move(
+                        snapshot,
+                        "implement-review",
+                        {type: "first-created-child", parentTaskId: snapshot.activeTaskId},
+                        toCreateTicketEffects(snapshot.activeTaskId, parsed.reviewFindings),
+                    );
+                }
+
+                default:
+                    return error(
+                        snapshot,
+                        event,
+                        "Expected <transition>subtask-commit</transition> or findings + <transition>implement-review</transition>",
+                    );
+            }
+        }
+
+        case "implement-review": {
+            if (!snapshot.activeTaskParentId) {
+                return error(snapshot, event, "implement-review requires activeTaskParentId in snapshot");
+            }
+
+            const effects: WorkflowEffect[] = [{type: "CLOSE_TICKET", taskId: snapshot.activeTaskId}];
+
+            if (snapshot.activeTaskNextSiblingId) {
+                return move(snapshot, "implement-review", {type: "next-sibling"}, effects);
+            }
+
+            return move(snapshot, "review", {type: "parent"}, effects);
+        }
+
+        case "subtask-commit": {
+            if (!parsed.commitMessage) {
+                return error(snapshot, event, "Expected <commit-message>...</commit-message>");
+            }
+
+            const effects: WorkflowEffect[] = [
+                {type: "CLOSE_TICKET", taskId: snapshot.activeTaskId},
+                {type: "RUN_JJ_COMMIT", message: parsed.commitMessage},
+            ];
+
+            if (snapshot.activeTaskNextSiblingId) {
+                return move(snapshot, "implement", {type: "next-sibling"}, effects);
+            }
+
+            return move(snapshot, "manual-test", {type: "root"}, effects);
+        }
+
+        case "manual-test": {
+            return error(
+                snapshot,
+                event,
+                "Manual test gate is advanced by MANUAL_TESTS_PASSED, not assistant COMPLETE",
+            );
+        }
+
+        case "commit": {
+            if (!parsed.commitMessage) {
+                return error(snapshot, event, "Expected <commit-message>...</commit-message>");
+            }
+
+            return move(snapshot, "complete", {type: "root"}, [
+                {type: "CLOSE_TICKET", taskId: snapshot.rootTaskId},
+                {type: "RUN_JJ_COMMIT", message: parsed.commitMessage},
+            ]);
+        }
+
+        case "complete": {
+            return ignored(snapshot, event, "Workflow is complete");
+        }
+
+        default: {
+            return assertNever(snapshot.state);
+        }
+    }
+}
+
+function move(
+    snapshot: WorkflowSnapshot,
+    state: WorkflowState,
+    activeTaskTarget: ActiveTaskTarget,
+    effects: WorkflowEffect[] = [],
+): TransitionDecision {
+    return {
+        kind: "applied",
+        state,
+        activeTaskTarget,
+        effects,
+    };
+}
+
+function stay(snapshot: WorkflowSnapshot, effects: WorkflowEffect[] = []): TransitionDecision {
+    return {
+        kind: "applied",
+        state: snapshot.state,
+        activeTaskTarget: {type: "current"},
+        effects,
+    };
+}
+
+function ignored(snapshot: WorkflowSnapshot, event: WorkflowEvent, reason?: string): TransitionDecision {
+    return {
+        kind: "ignored",
+        state: snapshot.state,
+        activeTaskTarget: {type: "current"},
+        effects: [],
+        reason: reason,
+    };
+}
+
+function error(snapshot: WorkflowSnapshot, event: WorkflowEvent, reason?: string): TransitionDecision {
+    return {
+        kind: "rejected",
+        state: snapshot.state,
+        activeTaskTarget: {type: "current"},
+        effects: [],
+        reason: reason ?? `Event ${event.type} is not handled in state ${snapshot.state}`,
+    };
+}
+
+function toCreateTicketEffects(parentTaskId: string, drafts: TicketDraft[]): WorkflowEffect[] {
+    return drafts.map((draft) => ({
+        type: "CREATE_TICKET" as const,
+        parentTaskId,
+        title: draft.title,
+        description: draft.description,
+        idempotencyKey: `${parentTaskId}::${draft.title}`,
+    }));
+}
+
+function parseRequestedStateFromAssistantMessage(messageText: string): WorkflowState | null {
+    const explicitMatches = [...messageText.matchAll(/<transition>\s*([a-z-]+)\s*<\/transition>/gi)];
+    for (let i = explicitMatches.length - 1; i >= 0; i--) {
+        const raw = explicitMatches[i]?.[1];
+        if (!raw) continue;
+        const normalized = raw.trim().toLowerCase();
+        if (isWorkflowState(normalized)) return normalized;
+    }
+    return null;
+}
+
+type DraftListParseResult =
+    | { drafts: TicketDraft[] }
+    | { error: string };
+
+function parsePlanSubtasksFromRootTicketMarkdown(rootTicketMarkdown?: string): DraftListParseResult {
+    if (!rootTicketMarkdown) {
+        return {error: "Root ticket markdown is required."};
+    }
+
+    const yaml = extractYamlPlanBlock(rootTicketMarkdown);
+    if (!yaml) {
+        return {error: "Could not find a `## Plan` section with a <subtasks>...</subtasks> block."};
+    }
+
+    return parseYamlTicketList(yaml, "Subtask");
+}
+
+function parseTicketDraftListFromTag(text: string, tagName: "review-findings"): DraftListParseResult | null {
+    const yamlString = extractTaggedYamlBlock(text, tagName);
+    if (!yamlString) return null;
+
+    return parseYamlTicketList(yamlString, "Finding");
+}
+
+function parseYamlTicketList(yamlString: string, label: string): DraftListParseResult {
+    let parsed: unknown;
+    try {
+        parsed = parseYamlDocument(yamlString);
+    } catch (e) {
+        return {error: `Failed to parse ${label} YAML block: ${e}`};
+    }
+
+    if (!parsed) {
+        return {drafts: []};
+    }
+
+    if (!Array.isArray(parsed)) {
+        return {error: `${label} YAML block must be a list (a YAML sequence).`};
+    }
+
+    const drafts: TicketDraft[] = [];
+
+    for (let i = 0; i < parsed.length; i++) {
+        const item = parsed[i];
+        if (!item || typeof item !== "object") {
+            return {error: `${label} ${i + 1} is not an object.`};
+        }
+
+        const title = typeof (item as { title?: unknown }).title === "string"
+            ? (item as { title: string }).title.trim()
+            : "";
+
+        if (!title) {
+            return {error: `${label} ${i + 1} is missing a non-empty string 'title'.`};
+        }
+
+        const description = typeof (item as { description?: unknown }).description === "string"
+            ? (item as { description: string }).description
+            : "";
+
+        const tddValue = (item as { tdd?: unknown }).tdd;
+        const tdd = typeof tddValue === "boolean" ? tddValue : true;
+
+        drafts.push({title, description, tdd});
+    }
+
+    return {drafts};
+}
+
+/**
+ * Extract YAML inside <subtasks>...</subtasks> under the first ## Plan section.
+ */
+function extractYamlPlanBlock(ticketMarkdown: string): string | null {
+    const normalized = normalizeNewlines(ticketMarkdown);
+
+    const planHeaderMatch = /^## Plan\s*$/m.exec(normalized);
+    if (!planHeaderMatch) return null;
+
+    const afterPlanHeader = normalized.slice(planHeaderMatch.index + planHeaderMatch[0].length);
+
+    const startMatch = /^\s*<subtasks>\s*$/m.exec(afterPlanHeader);
+    if (startMatch) {
+        const afterStartLine = afterPlanHeader.slice(startMatch.index + startMatch[0].length);
+        const firstNewline = afterStartLine.indexOf("\n");
+        const body = firstNewline === -1 ? "" : afterStartLine.slice(firstNewline + 1);
+
+        const endMatch = /^\s*<\/subtasks>\s*$/m.exec(body);
+        if (!endMatch) return null;
+        return body.slice(0, endMatch.index).trim();
+    }
+
+    const startIdx = afterPlanHeader.indexOf("<subtasks>");
+    if (startIdx === -1) return null;
+    const endIdx = afterPlanHeader.indexOf("</subtasks>", startIdx + "<subtasks>".length);
+    if (endIdx === -1) return null;
+    return afterPlanHeader.slice(startIdx + "<subtasks>".length, endIdx).trim();
+}
+
+function parseCommitMessageFromAssistantMessage(messageText: string): string | null {
+    const raw = extractTaggedYamlBlock(messageText, "commit-message");
+    if (!raw) return null;
+    const normalized = normalizeNewlines(raw).trim();
+    return normalized.length > 0 ? normalized : null;
+}
+
+function extractTaggedYamlBlock(text: string, tagName: string): string | null {
+    const normalized = normalizeNewlines(text);
+
+    const startMatch = new RegExp(`^\\s*<${tagName}>\\s*$`, "m").exec(normalized);
+    if (startMatch) {
+        const afterStart = normalized.slice(startMatch.index + startMatch[0].length);
+        const firstNewline = afterStart.indexOf("\n");
+        const body = firstNewline === -1 ? "" : afterStart.slice(firstNewline + 1);
+
+        const endMatch = new RegExp(`^\\s*</${tagName}>\\s*$`, "m").exec(body);
+        if (!endMatch) return null;
+        return body.slice(0, endMatch.index).trim();
+    }
+
+    const startIdx = normalized.indexOf(`<${tagName}>`);
+    if (startIdx === -1) return null;
+    const endIdx = normalized.indexOf(`</${tagName}>`, startIdx + tagName.length + 2);
+    if (endIdx === -1) return null;
+    return normalized.slice(startIdx + tagName.length + 2, endIdx).trim();
+}
+
+function parseYamlDocument(yamlString: string): unknown {
+    const wrapped = `---\n${yamlString}\n---`;
+    return parseFrontmatter(wrapped).frontmatter as unknown;
+}
+
+function normalizeNewlines(value: string): string {
+    return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function isWorkflowState(value: string): value is WorkflowState {
+    return (
+        value === "refine"
+        || value === "plan"
+        || value === "review-plan"
+        || value === "implement"
+        || value === "review"
+        || value === "implement-review"
+        || value === "subtask-commit"
+        || value === "manual-test"
+        || value === "commit"
+        || value === "complete"
+    );
+}
+
+function assertNever(value: never): never {
+    throw new Error(`Unhandled value: ${String(value)}`);
+}

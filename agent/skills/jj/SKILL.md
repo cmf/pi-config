@@ -35,7 +35,7 @@ jj commit -m "message"
 ## Essential Commands
 ```bash
 jj st                         # Status
-jj diff                       # Working copy diff
+jj diff --git --color=never    # Working copy diff (always use git-style for clarity)
 jj log -r <revset> [-p]        # History
 jj show -r <rev>               # Show revision
 jj new [-m "msg"] [<base>]    # New commit
@@ -47,6 +47,17 @@ jj absorb                      # Auto-distribute changes into ancestors
 jj abandon <rev>               # Drop commit
 jj restore <files>             # Discard changes to files
 ```
+
+## Diff formatting (Critical for AI/harnesses)
+
+`jj diff` defaults to an inline/word-diff format (`:color-words`) that relies on ANSI styling.
+If ANSI codes are stripped (common in logs / agent harnesses), edits can appear as *merged tokens*
+like `status: openclosed`, which can mislead an agent into thinking files are corrupted.
+
+**Rules:**
+- When you need to *read/interpret* diffs in an agent loop, prefer:
+  - `jj diff --git --color=never`
+- Avoid using the default inline format in transcripts.
 
 ## Revsets / Filesets / Templates
 JJ uses DSLs for selection and output.
@@ -64,11 +75,26 @@ A | B, A & B, A ~ B      # Union, intersection, difference
 
 **Filesets:** regular paths are valid filesets; globs are default.
 ```bash
-jj diff 'src/*.rs'       # Glob by default
-jj diff 'cwd:"src/*.rs"' # Literal path when needed
+jj diff --git --color=never 'src/*.rs'        # Glob by default
+jj diff --git --color=never 'cwd:"src/*.rs"'  # Literal path when needed
 ```
 
 ## Common Pitfalls
+
+0) **Diff output can be misleading if ANSI styles are stripped**
+
+If you see “corrupted-looking” lines like `openclosed`, it’s usually the inline diff formatter.
+Re-run with:
+
+```bash
+jj diff --git --color=never
+```
+
+Or set it permanently:
+
+```bash
+jj config set --user ui.diff-formatter :git
+```
 
 1) **Use `-r` not `--revisions`:**
 ```bash
@@ -102,8 +128,8 @@ jj log -r 'bookmarks(abc)' # ✅ bookmark name patterns
 
 6) **Glob patterns are default in filesets:**
 ```bash
-jj diff 'src/*.rs'         # glob
-jj diff 'cwd:"src/*.rs"'   # literal path
+jj diff --git --color=never 'src/*.rs'         # glob
+jj diff --git --color=never 'cwd:"src/*.rs"'   # literal path
 ```
 
 ## Bookmarks (Branches)

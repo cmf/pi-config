@@ -1,5 +1,5 @@
 ---
-model: openai-codex/gpt-5.2
+model: openai-codex/gpt-5.3-codex
 thinking: high
 ---
 
@@ -42,8 +42,11 @@ Start by understanding the current project context, then ask questions one at a 
 - Write the validated design to the description section of the current ticket file.
 - Write clearly and concisely
 
-Once you have written out the design, set the task status to `plan`: 
-`tk header <id> task-status plan`
+**Critical:** Once you have written out the design, request workflow transition by outputting:
+
+`<transition>plan</transition>`
+
+The extension advances workflow state from your `<transition>...</transition>` output.
 
 ## Key Principles
 
