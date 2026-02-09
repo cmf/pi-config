@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:build": "rm -rf .test-dist && tsc -p tsconfig.test.json",
+    "test": "npm run test:build && node --test .test-dist/test/**/*.test.js",
     "check": "npm run typecheck"
   },
   "pi": {

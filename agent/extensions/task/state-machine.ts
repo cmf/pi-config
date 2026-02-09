@@ -1,13 +1,12 @@
 import {parseFrontmatter} from "@mariozechner/pi-coding-agent";
 
 /**
- * Exploratory v2 model:
- * - single assistant-turn completion event
- * - parsing assistant output inside the functional core
- * - plan subtasks sourced from root ticket markdown (parity with index.ts)
- * - simpler, generic effect model (idempotent CREATE_TICKET)
+ * Explicit task workflow state machine used by the task extension shell (index.ts).
  *
- * This file is still a model only (not wired into index.ts yet).
+ * Design notes:
+ * - Transitions are pure and deterministic.
+ * - Assistant output parsing happens in the functional core.
+ * - The shell interprets emitted effects (tk/jj operations).
  */
 
 export type WorkflowState =
@@ -21,6 +20,19 @@ export type WorkflowState =
     | "manual-test"
     | "commit"
     | "complete";
+
+export const WORKFLOW_STATES: readonly WorkflowState[] = [
+    "refine",
+    "plan",
+    "review-plan",
+    "implement",
+    "review",
+    "implement-review",
+    "subtask-commit",
+    "manual-test",
+    "commit",
+    "complete",
+] as const;
 
 export type WorkflowEvent =
     | {
@@ -161,6 +173,96 @@ export function parseAssistantOutput(
     };
 }
 
+export function canReplayCompleteFromAssistantMessage(
+    state: WorkflowState,
+    assistantMessage: string,
+): boolean {
+    const parsedResult = parseAssistantOutput(assistantMessage, state);
+    if ("error" in parsedResult) {
+        return false;
+    }
+
+    const parsed = parsedResult.parsed;
+
+    switch (state) {
+        case "refine":
+            return parsed.requestedState === "plan";
+
+        case "plan":
+            return parsed.requestedState === "review-plan";
+
+        case "review-plan":
+            return parsed.requestedState === "review-plan" || parsed.requestedState === "implement";
+
+        case "review":
+            return parsed.requestedState === "subtask-commit"
+                || (parsed.requestedState === "implement-review" && parsed.reviewFindings.length > 0);
+
+        case "subtask-commit":
+        case "commit":
+            return Boolean(parsed.commitMessage);
+
+        default:
+            return false;
+    }
+}
+
+export function isWorkflowState(value: string): value is WorkflowState {
+    return WORKFLOW_STATES.includes(value as WorkflowState);
+}
+
+/**
+ * Validates persisted active-path depth against a workflow state.
+ * Depth semantics:
+ * - 0 => root ticket
+ * - 1 => root child (subtask)
+ * - 2 => root child child (review-finding implementation)
+ */
+export function stateAllowsActiveDepth(state: WorkflowState, depth: number): boolean {
+    if (depth < 0) return false;
+
+    if (
+        state === "refine"
+        || state === "plan"
+        || state === "review-plan"
+        || state === "manual-test"
+        || state === "commit"
+        || state === "complete"
+    ) {
+        return depth === 0;
+    }
+
+    if (state === "implement" || state === "review" || state === "subtask-commit") {
+        return depth === 1;
+    }
+
+    if (state === "implement-review") {
+        return depth === 2;
+    }
+
+    return false;
+}
+
+/**
+ * Indicates whether the shell should enrich an event with root ticket markdown
+ * before passing it through `transition`.
+ */
+export function eventNeedsRootTicketMarkdown(
+    snapshot: WorkflowSnapshot,
+    event: WorkflowEvent,
+): boolean {
+    if (event.type === "COMPLETE") {
+        return event.completedState === snapshot.state
+            && (snapshot.state === "plan" || snapshot.state === "review-plan");
+    }
+
+    if (event.type === "FORCE_LGTM") {
+        return event.completedState === snapshot.state && snapshot.state === "review-plan";
+    }
+
+    return false;
+}
+
 export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): TransitionDecision {
     if (event.type === "MANUAL_TESTS_PASSED") {
         switch (snapshot.state) {
@@ -268,6 +370,9 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
 
         case "review-plan": {
             switch (parsed.requestedState) {
+                case null:
+                    return ignored(snapshot, event) // Interactive turns
+
                 case "review-plan": {
                     const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
                     if ("error" in planSubtasksResult) {
@@ -599,21 +704,6 @@ function parseYamlDocument(yamlString: string): unknown {
 
 function normalizeNewlines(value: string): string {
     return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-
-function isWorkflowState(value: string): value is WorkflowState {
-    return (
-        value === "refine"
-        || value === "plan"
-        || value === "review-plan"
-        || value === "implement"
-        || value === "review"
-        || value === "implement-review"
-        || value === "subtask-commit"
-        || value === "manual-test"
-        || value === "commit"
-        || value === "complete"
-    );
 }
 
 function assertNever(value: never): never {

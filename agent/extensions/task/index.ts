@@ -6,14 +6,24 @@
  * - Task workspace: handles active task work
  */
 
-// State machine overview (canonical source: .tasks/workflow.json)
-//
-// Workflow states:
-// refine -> plan -> review-plan -> implement -> review -> (implement-review)* -> subtask-commit
-// -> manual-test -> commit -> complete
+// Workflow state graph is defined in state-machine.ts.
+// .tasks/workflow.json remains the persisted source of truth for current state/tree.
 
 import type {ExtensionAPI, ExtensionCommandContext, ExtensionContext} from "@mariozechner/pi-coding-agent";
 import {getAgentDir, parseFrontmatter} from "@mariozechner/pi-coding-agent";
+import {
+    canReplayCompleteFromAssistantMessage,
+    eventNeedsRootTicketMarkdown,
+    isWorkflowState,
+    stateAllowsActiveDepth,
+    transition as runWorkflowTransition,
+    type ActiveTaskTarget as MachineActiveTaskTarget,
+    type TransitionDecision as MachineTransitionDecision,
+    type WorkflowEffect as MachineWorkflowEffect,
+    type WorkflowEvent as MachineWorkflowEvent,
+    type WorkflowSnapshot as MachineWorkflowSnapshot,
+    type WorkflowState as MachineWorkflowState,
+} from "./state-machine.js";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
@@ -27,17 +37,56 @@ const MANUAL_TEST_PASS_PHRASE = "MANUAL TESTS PASSED";
 const MANUAL_TEST_PASS_REGEX = /\bMANUAL\s+TESTS?\s+PASSED\b/i;
 const ENABLE_TRANSITION_DEBUG = true;
 
-enum WorkflowState {
-    REFINE = "refine",
-    PLAN = "plan",
-    REVIEW_PLAN = "review-plan",
-    IMPLEMENT = "implement",
-    REVIEW = "review",
-    IMPLEMENT_REVIEW = "implement-review",
-    SUBTASK_COMMIT = "subtask-commit",
-    MANUAL_TEST = "manual-test",
-    COMMIT = "commit",
-    COMPLETE = "complete",
+export function normalizeSessionFilePath(sessionFile: string | undefined): string | null {
+    if (!sessionFile) return null;
+    const trimmed = sessionFile.trim();
+    return trimmed ? trimmed : null;
+}
+
+export function shouldNotifyPendingTransitionOutsideTaskLoop(params: {
+    workflowState: MachineWorkflowState;
+    latestAssistantMessageId: string | null;
+    latestAssistantMessageText: string;
+    lastConsumedAssistantId?: string | null;
+    taskLoopActive: boolean;
+}): boolean {
+    if (params.taskLoopActive) return false;
+    if (!params.latestAssistantMessageId) return false;
+    if ((params.lastConsumedAssistantId ?? null) === params.latestAssistantMessageId) return false;
+    return canReplayCompleteFromAssistantMessage(params.workflowState, params.latestAssistantMessageText);
+}
+
+export function completionReadyToMergeNotice(params: {
+    changed: boolean;
+    nextState: MachineWorkflowState;
+}): string | null {
+    if (!params.changed || params.nextState !== "complete") {
+        return null;
+    }
+
+    return "Final commit succeeded. Task workspace is ready to merge.";
+}
+
+export function resolveEditorPrefillValue(
+    input: string | undefined,
+    defaultValue: string,
+    options?: {singleLine?: boolean},
+): string {
+    const trimmed = typeof input === "string" ? input.trim() : "";
+    if (!trimmed) {
+        return defaultValue;
+    }
+
+    if (!options?.singleLine) {
+        return trimmed;
+    }
+
+    const firstNonEmptyLine = trimmed
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+
+    return firstNonEmptyLine ?? defaultValue;
 }
 
 type TaskNode = {
@@ -46,18 +95,20 @@ type TaskNode = {
     subtasks: TaskNode[];
 };
 
-type Workflow = TaskNode & {
+type PersistedWorkflow = TaskNode & {
     schema_version: number;
-    state: WorkflowState;
+    state: MachineWorkflowState;
     active_task_id: string;
     active_path_ids: string[];
     session_leaf_id: string;
+    session_file_path?: string | null;
+    last_consumed_assistant_id?: string | null;
     version: number;
     updated_at: string;
     last_transition?: {
         event: string;
-        from_state: WorkflowState;
-        to_state: WorkflowState;
+        from_state: MachineWorkflowState;
+        to_state: MachineWorkflowState;
         from_active_task_id: string;
         to_active_task_id: string;
         at: string;
@@ -66,30 +117,26 @@ type Workflow = TaskNode & {
 
 type AvailableModel = ReturnType<ExtensionContext["modelRegistry"]["getAll"]>[number];
 
-type ParsedAssistantOutput = {
-    text: string | null;
-    requestedState: WorkflowState | null;
-    reviewFindings: PlanSubtask[] | null;
-    commitMessage: string | null;
-};
-
-type WorkflowEvent =
-    | {type: "assistant-turn"; parsed: ParsedAssistantOutput}
-    | {type: "force-lgtm"}
-    | {type: "manual-test-passed"};
-
-type TransitionOutcome = {
-    changed: boolean;
-    shouldContinue: boolean;
-    workflow: Workflow;
-};
-
 type AgentStartWaiter = {
     resolve: (started: boolean) => void;
     timer: ReturnType<typeof setTimeout>;
 };
 
 let pendingAgentStart: AgentStartWaiter | null = null;
+let activeTaskLoopCount = 0;
+
+function isTaskLoopActive(): boolean {
+    return activeTaskLoopCount > 0;
+}
+
+async function withTaskLoopGuard<T>(run: () => Promise<T>): Promise<T> {
+    activeTaskLoopCount += 1;
+    try {
+        return await run();
+    } finally {
+        activeTaskLoopCount = Math.max(0, activeTaskLoopCount - 1);
+    }
+}
 
 function resolveNextAgentStart(): void {
     if (!pendingAgentStart) return;
@@ -121,10 +168,6 @@ function ensureWorkflowDirectory(root: string): void {
     fs.mkdirSync(path.join(root, WORKFLOW_DIR_NAME), {recursive: true});
 }
 
-function isWorkflowState(value: string): value is WorkflowState {
-    return Object.values(WorkflowState).includes(value as WorkflowState);
-}
-
 function isObject(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -137,7 +180,7 @@ function cloneTaskNode(node: TaskNode): TaskNode {
     };
 }
 
-function cloneWorkflow(workflow: Workflow): Workflow {
+function cloneWorkflow(workflow: PersistedWorkflow): PersistedWorkflow {
     return {
         ...cloneTaskNode(workflow),
         schema_version: workflow.schema_version,
@@ -145,6 +188,8 @@ function cloneWorkflow(workflow: Workflow): Workflow {
         active_task_id: workflow.active_task_id,
         active_path_ids: [...workflow.active_path_ids],
         session_leaf_id: workflow.session_leaf_id,
+        session_file_path: workflow.session_file_path ?? null,
+        last_consumed_assistant_id: workflow.last_consumed_assistant_id ?? null,
         version: workflow.version,
         updated_at: workflow.updated_at,
         last_transition: workflow.last_transition ? {...workflow.last_transition} : undefined,
@@ -193,41 +238,6 @@ function nextSibling(root: TaskNode, taskId: string): TaskNode | null {
     return siblings[index + 1] ?? null;
 }
 
-function isDepth0(pathIds: string[]): boolean {
-    return pathIds.length === 1;
-}
-
-function isDepth1(pathIds: string[]): boolean {
-    return pathIds.length === 2;
-}
-
-function isDepth2(pathIds: string[]): boolean {
-    return pathIds.length === 3;
-}
-
-function stateAllowsDepth(state: WorkflowState, pathIds: string[]): boolean {
-    if (
-        state === WorkflowState.REFINE ||
-        state === WorkflowState.PLAN ||
-        state === WorkflowState.REVIEW_PLAN ||
-        state === WorkflowState.MANUAL_TEST ||
-        state === WorkflowState.COMMIT ||
-        state === WorkflowState.COMPLETE
-    ) {
-        return isDepth0(pathIds);
-    }
-
-    if (state === WorkflowState.IMPLEMENT || state === WorkflowState.REVIEW || state === WorkflowState.SUBTASK_COMMIT) {
-        return isDepth1(pathIds);
-    }
-
-    if (state === WorkflowState.IMPLEMENT_REVIEW) {
-        return isDepth2(pathIds);
-    }
-
-    return false;
-}
-
 function validateTaskTreeNode(
     node: TaskNode,
     depth: number,
@@ -259,7 +269,7 @@ function validateTaskTreeNode(
     return null;
 }
 
-function validateWorkflow(workflow: Workflow): string | null {
+function validateWorkflow(workflow: PersistedWorkflow): string | null {
     if (!Number.isInteger(workflow.schema_version)) {
         return "workflow.schema_version must be an integer";
     }
@@ -273,6 +283,28 @@ function validateWorkflow(workflow: Workflow): string | null {
 
     if (typeof workflow.session_leaf_id !== "string" || !workflow.session_leaf_id.trim()) {
         return "workflow.session_leaf_id must be a non-empty string";
+    }
+
+    if (
+        workflow.session_file_path !== undefined
+        && workflow.session_file_path !== null
+        && (
+            typeof workflow.session_file_path !== "string"
+            || !workflow.session_file_path.trim()
+        )
+    ) {
+        return "workflow.session_file_path must be null/undefined or a non-empty string";
+    }
+
+    if (
+        workflow.last_consumed_assistant_id !== undefined
+        && workflow.last_consumed_assistant_id !== null
+        && (
+            typeof workflow.last_consumed_assistant_id !== "string"
+            || !workflow.last_consumed_assistant_id.trim()
+        )
+    ) {
+        return "workflow.last_consumed_assistant_id must be null/undefined or a non-empty string";
     }
 
     if (!isWorkflowState(workflow.state)) {
@@ -302,14 +334,15 @@ function validateWorkflow(workflow: Workflow): string | null {
         }
     }
 
-    if (!stateAllowsDepth(workflow.state, workflow.active_path_ids)) {
-        return `state ${workflow.state} is incompatible with active depth ${workflow.active_path_ids.length - 1}`;
+    const activeDepth = workflow.active_path_ids.length - 1;
+    if (!stateAllowsActiveDepth(workflow.state, activeDepth)) {
+        return `state ${workflow.state} is incompatible with active depth ${activeDepth}`;
     }
 
     return null;
 }
 
-function createInitialWorkflow(rootTaskId: string, rootTitle: string, sessionLeafId: string): Workflow {
+function createInitialWorkflow(rootTaskId: string, rootTitle: string, sessionLeafId: string): PersistedWorkflow {
     const normalizedTitle = rootTitle.trim() || rootTaskId;
     const now = new Date().toISOString();
     return {
@@ -317,16 +350,18 @@ function createInitialWorkflow(rootTaskId: string, rootTitle: string, sessionLea
         task_id: rootTaskId,
         title: normalizedTitle,
         subtasks: [],
-        state: WorkflowState.REFINE,
+        state: "refine",
         active_task_id: rootTaskId,
         active_path_ids: [rootTaskId],
         session_leaf_id: sessionLeafId,
+        session_file_path: null,
+        last_consumed_assistant_id: null,
         version: 1,
         updated_at: now,
         last_transition: {
             event: "initialize",
-            from_state: WorkflowState.REFINE,
-            to_state: WorkflowState.REFINE,
+            from_state: "refine",
+            to_state: "refine",
             from_active_task_id: rootTaskId,
             to_active_task_id: rootTaskId,
             at: now,
@@ -334,7 +369,7 @@ function createInitialWorkflow(rootTaskId: string, rootTitle: string, sessionLea
     };
 }
 
-function loadWorkflow(root: string): {workflow: Workflow} | {error: string} {
+function loadWorkflow(root: string): {workflow: PersistedWorkflow} | {error: string} {
     const workflowPath = getWorkflowPath(root);
     if (!fs.existsSync(workflowPath)) {
         return {
@@ -366,7 +401,7 @@ function loadWorkflow(root: string): {workflow: Workflow} | {error: string} {
         };
     }
 
-    const workflow = parsed as Workflow;
+    const workflow = parsed as PersistedWorkflow;
     const validationError = validateWorkflow(workflow);
     if (validationError) {
         return {
@@ -377,7 +412,7 @@ function loadWorkflow(root: string): {workflow: Workflow} | {error: string} {
     return {workflow};
 }
 
-function saveWorkflowAtomic(root: string, workflow: Workflow): {ok: true} | {ok: false; error: string} {
+function saveWorkflowAtomic(root: string, workflow: PersistedWorkflow): {ok: true} | {ok: false; error: string} {
     const validationError = validateWorkflow(workflow);
     if (validationError) {
         return {ok: false, error: `Refusing to save invalid workflow: ${validationError}`};
@@ -481,44 +516,13 @@ async function tkAddNoteBestEffort(
     await pi.exec("tk", ["add-note", taskId, note], {cwd});
 }
 
-function parseRequestedStateFromAssistantMessage(messageText: string): WorkflowState | null {
-    // Prefer the LAST explicit transition tag in the message so earlier quoted/examples don't win.
-    const explicitMatches = [...messageText.matchAll(/<transition>\s*([a-z-]+)\s*<\/transition>/gi)];
-    for (let i = explicitMatches.length - 1; i >= 0; i--) {
-        const raw = explicitMatches[i]?.[1];
-        if (!raw) continue;
-        const state = raw.trim().toLowerCase();
-        if (isWorkflowState(state)) return state;
-    }
-
-    const tagValue = extractTaggedYamlBlock(messageText, "transition");
-    if (tagValue) {
-        const state = tagValue.trim().toLowerCase();
-        if (isWorkflowState(state)) return state;
-    }
-
-    // Legacy fallback while prompts are migrated.
-    if (/task-status\s+plan\b/i.test(messageText)) {
-        return WorkflowState.PLAN;
-    }
-    if (/task-status\s+review-plan\b/i.test(messageText)) {
-        return WorkflowState.REVIEW_PLAN;
-    }
-
-    return null;
-}
-
-function listTransitionTagsInMessage(messageText: string): string[] {
-    return [...messageText.matchAll(/<transition>\s*([a-z-]+)\s*<\/transition>/gi)]
-        .map((match) => (match[1] ?? "").trim().toLowerCase())
-        .filter(Boolean);
-}
-
-function parseAssistantOutput(
+/**
+ * Shell helper: capture the newest assistant turn text (with debug diagnostics).
+ */
+function captureAssistantTurnMessage(
     ctx: ExtensionContext,
     previousAssistantId: string | null,
-    currentState: WorkflowState,
-): {parsed: ParsedAssistantOutput} | {error: string} {
+): {assistantMessage: string; assistantMessageId: string | null} | {error: string} {
     const latest = getLastAssistantMessage(ctx);
     if (!latest) {
         if (ENABLE_TRANSITION_DEBUG) {
@@ -541,41 +545,134 @@ function parseAssistantOutput(
     }
 
     const messageText = latest.text;
-    const transitionTags = messageText ? listTransitionTagsInMessage(messageText) : [];
-    const requestedState = messageText ? parseRequestedStateFromAssistantMessage(messageText) : null;
-
-    let reviewFindings: PlanSubtask[] | null = null;
-    if (currentState === WorkflowState.REVIEW) {
-        const findingsParse = messageText ? parseReviewFindingsFromAssistantMessage(messageText) : null;
-        if (findingsParse && "error" in findingsParse) {
-            return {error: findingsParse.error};
-        }
-        reviewFindings = findingsParse && "findings" in findingsParse ? findingsParse.findings : null;
-    } else if (ENABLE_TRANSITION_DEBUG && /<review-findings>/i.test(messageText)) {
-        ctx.ui.notify(
-            `transition-capture: ignoring <review-findings> block in state ${currentState}`,
-            "warning",
-        );
-    }
-
-    const commitMessage = messageText ? parseCommitMessageFromAssistantMessage(messageText) : null;
 
     if (ENABLE_TRANSITION_DEBUG) {
         const preview = messageText.replace(/\s+/g, " ").slice(0, 180);
         ctx.ui.notify(
-            `transition-capture: previous=${previousAssistantId ?? "(none)"} latest=${latest.id ?? "(none)"} tags=[${transitionTags.join(", ") || "none"}] parsed=${requestedState ?? "none"} findings=${reviewFindings?.length ?? 0} commit=${commitMessage ? "yes" : "no"}`,
+            `transition-capture: previous=${previousAssistantId ?? "(none)"} latest=${latest.id ?? "(none)"}`,
             "info",
         );
         ctx.ui.notify(`transition-capture: assistant-preview: ${preview}`, "info");
     }
 
-    return {
-        parsed: {
-            text: messageText,
-            requestedState,
-            reviewFindings,
-            commitMessage,
+    return {assistantMessage: messageText, assistantMessageId: latest.id};
+}
+
+function persistConsumedAssistantMessageId(
+    root: string,
+    workflow: PersistedWorkflow,
+    assistantMessageId: string | null,
+): {workflow: PersistedWorkflow} | {error: string} {
+    if (!assistantMessageId || !assistantMessageId.trim()) {
+        return {workflow};
+    }
+
+    if (workflow.last_consumed_assistant_id === assistantMessageId) {
+        return {workflow};
+    }
+
+    const updated = cloneWorkflow(workflow);
+    updated.last_consumed_assistant_id = assistantMessageId;
+    updated.updated_at = new Date().toISOString();
+
+    const saved = saveWorkflowAtomic(root, updated);
+    if (saved.ok === false) {
+        return {error: saved.error};
+    }
+
+    return {workflow: updated};
+}
+
+function persistSessionFilePath(
+    root: string,
+    workflow: PersistedWorkflow,
+    sessionFilePath: string | undefined,
+): {workflow: PersistedWorkflow} | {error: string} {
+    const normalized = normalizeSessionFilePath(sessionFilePath);
+    if ((workflow.session_file_path ?? null) === normalized) {
+        return {workflow};
+    }
+
+    const updated = cloneWorkflow(workflow);
+    updated.session_file_path = normalized;
+    updated.updated_at = new Date().toISOString();
+
+    const saved = saveWorkflowAtomic(root, updated);
+    if (saved.ok === false) {
+        return {error: saved.error};
+    }
+
+    return {workflow: updated};
+}
+
+async function replayPendingAssistantTransition(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    root: string,
+    workflow: PersistedWorkflow,
+): Promise<{changed: boolean; workflow: PersistedWorkflow} | {error: string}> {
+    const latest = getLastAssistantMessage(ctx);
+    if (!latest || !latest.id) {
+        return {changed: false, workflow};
+    }
+
+    if (workflow.last_consumed_assistant_id === latest.id) {
+        return {changed: false, workflow};
+    }
+
+    if (!canReplayCompleteFromAssistantMessage(workflow.state, latest.text)) {
+        return {changed: false, workflow};
+    }
+
+    if (ENABLE_TRANSITION_DEBUG) {
+        const preview = latest.text.replace(/\s+/g, " ").slice(0, 180);
+        ctx.ui.notify(
+            `transition-replay: attempting COMPLETE from assistant ${latest.id} in state ${workflow.state}`,
+            "info",
+        );
+        ctx.ui.notify(`transition-replay: assistant-preview: ${preview}`, "info");
+    }
+
+    const transition = await dispatchWorkflowEvent(
+        pi,
+        ctx,
+        root,
+        workflow,
+        {
+            type: "COMPLETE",
+            completedState: workflow.state,
+            assistantMessage: latest.text,
+            rootTicketMarkdown: "",
         },
+    );
+
+    if ("error" in transition) {
+        return {error: transition.error};
+    }
+
+    const consumed = persistConsumedAssistantMessageId(root, transition.workflow, latest.id);
+    if ("error" in consumed) {
+        return {error: consumed.error};
+    }
+
+    const completionNotice = completionReadyToMergeNotice({
+        changed: transition.changed,
+        nextState: consumed.workflow.state,
+    });
+    if (completionNotice) {
+        ctx.ui.notify(completionNotice, "info");
+    }
+
+    if (ENABLE_TRANSITION_DEBUG) {
+        ctx.ui.notify(
+            `transition-replay: result changed=${transition.changed ? "yes" : "no"}`,
+            "info",
+        );
+    }
+
+    return {
+        changed: transition.changed,
+        workflow: consumed.workflow,
     };
 }
 
@@ -593,7 +690,7 @@ function userConfirmedManualTests(ctx: ExtensionContext): boolean {
 
         const text = extractMessageText(message.content).trim();
         if (!text) continue;
-        if (text.includes("## Ticket Metadata") && text.includes("## Workflow Transition Contract")) {
+        if (text.includes("## Ticket Metadata") && text.includes("## Ticket Contents")) {
             continue;
         }
 
@@ -604,14 +701,14 @@ function userConfirmedManualTests(ctx: ExtensionContext): boolean {
 }
 
 function buildTransitionedWorkflow(
-    workflow: Workflow,
+    workflow: PersistedWorkflow,
     params: {
-        toState: WorkflowState;
+        toState: MachineWorkflowState;
         activeTaskId?: string;
         event: string;
-        mutateTree?: (draft: Workflow) => void;
+        mutateTree?: (draft: PersistedWorkflow) => void;
     },
-): {workflow: Workflow} | {error: string} {
+): {workflow: PersistedWorkflow} | {error: string} {
     const draft = cloneWorkflow(workflow);
 
     if (params.mutateTree) {
@@ -710,77 +807,6 @@ async function createOrReuseChildTask(
     return {id: created.id};
 }
 
-async function ensurePlanSubtasks(
-    pi: ExtensionAPI,
-    ctx: ExtensionContext,
-    root: string,
-    workflow: Workflow,
-    subtasks: PlanSubtask[],
-): Promise<{children: TaskNode[]} | {error: string}> {
-    const existingByTitle = new Map(workflow.subtasks.map((node) => [node.title, node]));
-    const children: TaskNode[] = [];
-
-    for (const subtask of subtasks) {
-        const existing = existingByTitle.get(subtask.title);
-        if (existing) {
-            children.push(cloneTaskNode(existing));
-            continue;
-        }
-
-        const created = await createOrReuseChildTask(pi, root, workflow.task_id, subtask.title, subtask.description);
-        if ("error" in created) {
-            return created;
-        }
-
-        ctx.ui.notify(`review-plan: created/reused subtask ${created.id} (${subtask.title})`, "info");
-        children.push({
-            task_id: created.id,
-            title: subtask.title,
-            subtasks: [],
-        });
-    }
-
-    return {children};
-}
-
-async function ensureReviewFindingTasks(
-    pi: ExtensionAPI,
-    ctx: ExtensionContext,
-    root: string,
-    workflow: Workflow,
-    findings: PlanSubtask[],
-): Promise<{children: TaskNode[]} | {error: string}> {
-    const activeSubtask = findNodeById(workflow, workflow.active_task_id);
-    if (!activeSubtask) {
-        return {error: `Active subtask not found: ${workflow.active_task_id}`};
-    }
-
-    const existingByTitle = new Map(activeSubtask.subtasks.map((node) => [node.title, node]));
-    const children: TaskNode[] = [];
-
-    for (const finding of findings) {
-        const existing = existingByTitle.get(finding.title);
-        if (existing) {
-            children.push(cloneTaskNode(existing));
-            continue;
-        }
-
-        const created = await createOrReuseChildTask(pi, root, activeSubtask.task_id, finding.title, finding.description);
-        if ("error" in created) {
-            return created;
-        }
-
-        ctx.ui.notify(`review: created/reused finding ${created.id} (${finding.title})`, "info");
-        children.push({
-            task_id: created.id,
-            title: finding.title,
-            subtasks: [],
-        });
-    }
-
-    return {children};
-}
-
 async function runJjCommitWithCleanCheck(
     pi: ExtensionAPI,
     root: string,
@@ -803,42 +829,220 @@ async function runJjCommitWithCleanCheck(
     return {ok: true};
 }
 
-async function loadPlanSubtasksFromRootTicket(
-    pi: ExtensionAPI,
-    root: string,
-    workflow: Workflow,
-): Promise<{subtasks: PlanSubtask[]} | {error: string}> {
-    const load = await loadTicketMarkdown(pi, root, workflow.task_id);
-    if ("error" in load) {
-        return load;
-    }
-
-    const parsed = parsePlanSubtasksFromTicketMarkdown(load.content);
-    if ("error" in parsed) {
-        return parsed;
-    }
-
-    if (parsed.subtasks.length === 0) {
-        return {error: "No subtasks found in root ticket plan."};
-    }
-
-    return parsed;
-}
-
-function notifyTransition(ctx: ExtensionContext, before: Workflow, after: Workflow): void {
+function notifyTransition(ctx: ExtensionContext, before: PersistedWorkflow, after: PersistedWorkflow): void {
     const from = `${before.state}/${before.active_task_id}`;
     const to = `${after.state}/${after.active_task_id}`;
     const versionInfo = `v${before.version}→v${after.version}`;
     ctx.ui.notify(`workflow transition ${versionInfo}: ${from} -> ${to}`, "info");
 }
 
+// ---------------------------------------------------------------------------
+// Functional core / imperative shell boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * Functional-core adapter: map persisted workflow state into the pure machine snapshot.
+ */
+function buildMachineSnapshot(workflow: PersistedWorkflow): MachineWorkflowSnapshot {
+    const parent = findParentById(workflow, workflow.active_task_id);
+    const sibling = nextSibling(workflow, workflow.active_task_id);
+
+    return {
+        state: workflow.state,
+        rootTaskId: workflow.task_id,
+        activeTaskId: workflow.active_task_id,
+        activeTaskParentId: parent ? parent.task_id : null,
+        activeTaskNextSiblingId: sibling ? sibling.task_id : null,
+    };
+}
+
+/**
+ * Enrich machine events with root ticket markdown when required by the pure transition logic.
+ */
+async function withRequiredRootTicketMarkdown(
+    pi: ExtensionAPI,
+    root: string,
+    workflow: PersistedWorkflow,
+    snapshot: MachineWorkflowSnapshot,
+    event: MachineWorkflowEvent,
+): Promise<{event: MachineWorkflowEvent} | {error: string}> {
+    if (!eventNeedsRootTicketMarkdown(snapshot, event)) {
+        return {event};
+    }
+
+    if (event.type === "COMPLETE" && event.rootTicketMarkdown.trim()) {
+        return {event};
+    }
+
+    if (event.type === "FORCE_LGTM" && event.rootTicketMarkdown?.trim()) {
+        return {event};
+    }
+
+    const loaded = await loadTicketMarkdown(pi, root, workflow.task_id);
+    if ("error" in loaded) {
+        return {error: loaded.error};
+    }
+
+    if (event.type === "COMPLETE") {
+        return {
+            event: {
+                ...event,
+                rootTicketMarkdown: loaded.content,
+            },
+        };
+    }
+
+    if (event.type === "FORCE_LGTM") {
+        return {
+            event: {
+                ...event,
+                rootTicketMarkdown: loaded.content,
+            },
+        };
+    }
+
+    return {event};
+}
+
+function applyCreatedChildrenToTree(workflow: PersistedWorkflow, createdChildrenByParent: Map<string, TaskNode[]>): void {
+    for (const [parentTaskId, children] of createdChildrenByParent.entries()) {
+        const parentNode = findNodeById(workflow, parentTaskId);
+        if (!parentNode) {
+            throw new Error(`Parent task not found while applying CREATE_TICKET effects: ${parentTaskId}`);
+        }
+        parentNode.subtasks = children.map(cloneTaskNode);
+    }
+}
+
+type InterpretedMachineEffectsResult = {
+    createdChildrenByParent: Map<string, TaskNode[]>;
+};
+
+/**
+ * Imperative shell: execute machine-emitted effects against tk/jj.
+ */
+async function interpretMachineEffects(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    root: string,
+    effects: MachineWorkflowEffect[],
+): Promise<InterpretedMachineEffectsResult | {error: string}> {
+    const createdChildrenByParent = new Map<string, TaskNode[]>();
+
+    for (const effect of effects) {
+        if (effect.type === "CREATE_TICKET") {
+            const created = await createOrReuseChildTask(
+                pi,
+                root,
+                effect.parentTaskId,
+                effect.title,
+                effect.description,
+            );
+            if ("error" in created) {
+                return {error: created.error};
+            }
+
+            const existing = createdChildrenByParent.get(effect.parentTaskId) ?? [];
+            existing.push({
+                task_id: created.id,
+                title: effect.title,
+                subtasks: [],
+            });
+            createdChildrenByParent.set(effect.parentTaskId, existing);
+            ctx.ui.notify(`workflow effect: created/reused task ${created.id} (${effect.title})`, "info");
+            continue;
+        }
+
+        if (effect.type === "ADD_NOTE") {
+            await tkAddNoteBestEffort(pi, root, effect.taskId, effect.note);
+            continue;
+        }
+
+        if (effect.type === "CLOSE_TICKET") {
+            const closed = await tkCloseTask(pi, root, effect.taskId);
+            if (closed.ok === false) {
+                return {error: `Failed to close task ${effect.taskId}: ${closed.error}`};
+            }
+            continue;
+        }
+
+        if (effect.type === "RUN_JJ_COMMIT") {
+            const commitSubject = effect.message.split("\n")[0]?.trim() || "(empty subject)";
+            ctx.ui.notify(`workflow effect: running jj commit (${commitSubject})`, "info");
+            const committed = await runJjCommitWithCleanCheck(pi, root, effect.message);
+            if (committed.ok === false) {
+                return {error: committed.error};
+            }
+            ctx.ui.notify(`workflow effect: jj commit succeeded (${commitSubject})`, "info");
+            continue;
+        }
+    }
+
+    return {createdChildrenByParent};
+}
+
+/**
+ * Resolve machine-selected active task target against the (possibly mutated) workflow tree.
+ */
+function resolveNextActiveTaskId(
+    workflow: PersistedWorkflow,
+    currentActiveTaskId: string,
+    target: MachineActiveTaskTarget,
+): {activeTaskId: string} | {error: string} {
+    if (target.type === "current") {
+        return {activeTaskId: currentActiveTaskId};
+    }
+
+    if (target.type === "root") {
+        return {activeTaskId: workflow.task_id};
+    }
+
+    if (target.type === "parent") {
+        const parent = findParentById(workflow, currentActiveTaskId);
+        if (!parent) {
+            return {error: `No parent found for active task ${currentActiveTaskId}`};
+        }
+        return {activeTaskId: parent.task_id};
+    }
+
+    if (target.type === "next-sibling") {
+        const sibling = nextSibling(workflow, currentActiveTaskId);
+        if (!sibling) {
+            return {error: `No next sibling found for active task ${currentActiveTaskId}`};
+        }
+        return {activeTaskId: sibling.task_id};
+    }
+
+    const parentNode = findNodeById(workflow, target.parentTaskId);
+    if (!parentNode) {
+        return {error: `Parent task not found for first-created-child target: ${target.parentTaskId}`};
+    }
+
+    const firstChild = parentNode.subtasks[0];
+    if (!firstChild) {
+        return {error: `No children found under parent ${target.parentTaskId} for first-created-child target`};
+    }
+
+    return {activeTaskId: firstChild.task_id};
+}
+
+function machineEventAuditLabel(event: MachineWorkflowEvent): string {
+    if (event.type === "COMPLETE") {
+        return `machine:complete:${event.completedState}`;
+    }
+    if (event.type === "FORCE_LGTM") {
+        return `machine:force-lgtm:${event.completedState}`;
+    }
+    return "machine:manual-tests-passed";
+}
+
 async function dispatchWorkflowEvent(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
     root: string,
-    workflow: Workflow,
-    event: WorkflowEvent,
-): Promise<TransitionOutcome | {error: string}> {
+    workflow: PersistedWorkflow,
+    event: MachineWorkflowEvent,
+): Promise<{changed: boolean; workflow: PersistedWorkflow} | {error: string}> {
     const transitionError = (message: string): {error: string} => ({
         error: `${message}. Manual cleanup required in ${getWorkflowPath(root)}.`,
     });
@@ -848,302 +1052,79 @@ async function dispatchWorkflowEvent(
         return transitionError(`Workflow invariant failure before transition: ${beforeError}.`);
     }
 
-    const saveTransition = (nextWorkflow: Workflow, shouldContinue: boolean): TransitionOutcome | {error: string} => {
-        const saved = saveWorkflowAtomic(root, nextWorkflow);
-        if (saved.ok === false) {
-            return {error: saved.error};
-        }
+    // 1) Build pure-machine inputs.
+    const snapshot = buildMachineSnapshot(workflow);
+    const enriched = await withRequiredRootTicketMarkdown(pi, root, workflow, snapshot, event);
+    if ("error" in enriched) {
+        return {error: enriched.error};
+    }
 
-        notifyTransition(ctx, workflow, nextWorkflow);
-        return {
-            changed: true,
-            shouldContinue,
-            workflow: nextWorkflow,
-        };
+    const machineEvent = enriched.event;
+
+    // 2) Run pure transition logic.
+    const decision: MachineTransitionDecision = runWorkflowTransition(snapshot, machineEvent);
+
+    if (decision.kind === "ignored") {
+        if (ENABLE_TRANSITION_DEBUG && decision.reason) {
+            ctx.ui.notify(`workflow transition ignored: ${decision.reason}`, "info");
+        }
+        return {changed: false, workflow};
+    }
+
+    if (decision.kind === "rejected") {
+        ctx.ui.notify(`workflow transition rejected: ${decision.reason}`, "warning");
+        return {changed: false, workflow};
+    }
+
+    // 3) Interpret side effects.
+    const interpreted = await interpretMachineEffects(pi, ctx, root, decision.effects);
+    if ("error" in interpreted) {
+        return {error: interpreted.error};
+    }
+
+    const mutateTree = interpreted.createdChildrenByParent.size > 0
+        ? (draft: PersistedWorkflow) => applyCreatedChildrenToTree(draft, interpreted.createdChildrenByParent)
+        : undefined;
+
+    const preview = cloneWorkflow(workflow);
+    if (mutateTree) {
+        try {
+            mutateTree(preview);
+        } catch (error) {
+            return transitionError(`Failed to apply tree mutation preview: ${error}`);
+        }
+    }
+
+    const resolvedTarget = resolveNextActiveTaskId(
+        preview,
+        workflow.active_task_id,
+        decision.activeTaskTarget,
+    );
+    if ("error" in resolvedTarget) {
+        return transitionError(resolvedTarget.error);
+    }
+
+    // 4) Persist new workflow state with validated invariants.
+    const transitioned = buildTransitionedWorkflow(workflow, {
+        toState: decision.state,
+        activeTaskId: resolvedTarget.activeTaskId,
+        event: machineEventAuditLabel(machineEvent),
+        mutateTree,
+    });
+    if ("error" in transitioned) {
+        return transitionError(transitioned.error);
+    }
+
+    const saved = saveWorkflowAtomic(root, transitioned.workflow);
+    if (saved.ok === false) {
+        return {error: saved.error};
+    }
+
+    notifyTransition(ctx, workflow, transitioned.workflow);
+    return {
+        changed: true,
+        workflow: transitioned.workflow,
     };
-
-    if (event.type === "manual-test-passed") {
-        if (workflow.state !== WorkflowState.MANUAL_TEST) {
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.COMMIT,
-            activeTaskId: workflow.task_id,
-            event: "manual-test-passed",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    const isForceLgtm = event.type === "force-lgtm";
-    const parsed = event.type === "assistant-turn"
-        ? event.parsed
-        : {
-            text: null,
-            requestedState: null,
-            reviewFindings: null,
-            commitMessage: null,
-        };
-
-    if (workflow.state === WorkflowState.REFINE) {
-        if (parsed.requestedState !== WorkflowState.PLAN) {
-            if (parsed.text && /<transition>/i.test(parsed.text)) {
-                ctx.ui.notify("refine: saw <transition> tag but could not parse a valid target state", "warning");
-            }
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.PLAN,
-            activeTaskId: workflow.task_id,
-            event: "refine-complete",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    if (workflow.state === WorkflowState.PLAN) {
-        const requestedReviewPlan = parsed.requestedState === WorkflowState.REVIEW_PLAN;
-        if (!requestedReviewPlan) {
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        const plan = await loadPlanSubtasksFromRootTicket(pi, root, workflow);
-        if ("error" in plan) {
-            return {error: `plan -> review-plan failed: ${plan.error}`};
-        }
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.REVIEW_PLAN,
-            activeTaskId: workflow.task_id,
-            event: "plan-complete",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    if (workflow.state === WorkflowState.REVIEW_PLAN) {
-        if (!isForceLgtm && parsed.requestedState === WorkflowState.REVIEW_PLAN) {
-            const plan = await loadPlanSubtasksFromRootTicket(pi, root, workflow);
-            if ("error" in plan) {
-                return {error: `review-plan re-review failed: ${plan.error}`};
-            }
-
-            const transitioned = buildTransitionedWorkflow(workflow, {
-                toState: WorkflowState.REVIEW_PLAN,
-                activeTaskId: workflow.task_id,
-                event: "review-plan-rereview-transition",
-            });
-            if ("error" in transitioned) return transitionError(transitioned.error);
-            return saveTransition(transitioned.workflow, true);
-        }
-
-        if (!isForceLgtm && parsed.requestedState !== WorkflowState.IMPLEMENT) {
-            ctx.ui.notify("review-plan: waiting for <transition>implement</transition> (approve) or <transition>review-plan</transition> (re-review)", "warning");
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        const plan = await loadPlanSubtasksFromRootTicket(pi, root, workflow);
-        if ("error" in plan) {
-            return {error: `review-plan approval failed: ${plan.error}`};
-        }
-
-        const ensured = await ensurePlanSubtasks(pi, ctx, root, workflow, plan.subtasks);
-        if ("error" in ensured) {
-            return {error: ensured.error};
-        }
-
-        if (ensured.children.length === 0) {
-            return {error: "review-plan approval produced zero subtasks"};
-        }
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.IMPLEMENT,
-            activeTaskId: ensured.children[0].task_id,
-            event: isForceLgtm ? "force-lgtm-review-plan" : "review-plan-approve-transition",
-            mutateTree: (draft) => {
-                draft.subtasks = ensured.children;
-            },
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    if (workflow.state === WorkflowState.IMPLEMENT) {
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.REVIEW,
-            event: "implement-done",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    if (workflow.state === WorkflowState.REVIEW) {
-        if (isForceLgtm || parsed.requestedState === WorkflowState.SUBTASK_COMMIT) {
-            const transitioned = buildTransitionedWorkflow(workflow, {
-                toState: WorkflowState.SUBTASK_COMMIT,
-                event: isForceLgtm ? "force-lgtm-review" : "review-approve-transition",
-            });
-            if ("error" in transitioned) return transitionError(transitioned.error);
-            return saveTransition(transitioned.workflow, true);
-        }
-
-        if (parsed.reviewFindings && parsed.reviewFindings.length > 0) {
-            if (parsed.requestedState !== WorkflowState.IMPLEMENT_REVIEW) {
-                ctx.ui.notify("review: findings present; expected <transition>implement-review</transition>", "warning");
-                return {changed: false, shouldContinue: false, workflow};
-            }
-
-            const ensured = await ensureReviewFindingTasks(pi, ctx, root, workflow, parsed.reviewFindings);
-            if ("error" in ensured) {
-                return {error: ensured.error};
-            }
-
-            const transitioned = buildTransitionedWorkflow(workflow, {
-                toState: WorkflowState.IMPLEMENT_REVIEW,
-                activeTaskId: ensured.children[0].task_id,
-                event: "review-findings-transition",
-                mutateTree: (draft) => {
-                    const activeNode = findNodeById(draft, workflow.active_task_id);
-                    if (!activeNode) {
-                        throw new Error(`active node missing while applying review findings: ${workflow.active_task_id}`);
-                    }
-                    activeNode.subtasks = ensured.children;
-                },
-            });
-            if ("error" in transitioned) return transitionError(transitioned.error);
-            return saveTransition(transitioned.workflow, true);
-        }
-
-        if (parsed.requestedState === WorkflowState.IMPLEMENT_REVIEW) {
-            ctx.ui.notify("review: got <transition>implement-review</transition> but no <review-findings> block", "warning");
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        ctx.ui.notify("review: waiting for <transition>subtask-commit</transition> or findings + <transition>implement-review</transition>", "warning");
-        return {changed: false, shouldContinue: false, workflow};
-    }
-
-    if (workflow.state === WorkflowState.IMPLEMENT_REVIEW) {
-        const activeFinding = findNodeById(workflow, workflow.active_task_id);
-        if (!activeFinding) {
-            return transitionError(`Active finding not found: ${workflow.active_task_id}`);
-        }
-
-        const closeFinding = await tkCloseTask(pi, root, activeFinding.task_id);
-        if (closeFinding.ok === false) {
-            return {error: `Failed to close review finding ${activeFinding.task_id}: ${closeFinding.error}`};
-        }
-
-        const sibling = nextSibling(workflow, activeFinding.task_id);
-        if (sibling) {
-            const transitioned = buildTransitionedWorkflow(workflow, {
-                toState: WorkflowState.IMPLEMENT_REVIEW,
-                activeTaskId: sibling.task_id,
-                event: "implement-review-next-finding",
-            });
-            if ("error" in transitioned) return transitionError(transitioned.error);
-            return saveTransition(transitioned.workflow, true);
-        }
-
-        const parent = findParentById(workflow, activeFinding.task_id);
-        if (!parent) {
-            return transitionError(`Parent subtask not found for finding ${activeFinding.task_id}`);
-        }
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.REVIEW,
-            activeTaskId: parent.task_id,
-            event: "implement-review-back-to-review",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    if (workflow.state === WorkflowState.SUBTASK_COMMIT) {
-        if (!parsed.commitMessage) {
-            ctx.ui.notify("subtask-commit: waiting for <commit-message>...</commit-message>", "warning");
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        const activeSubtask = findNodeById(workflow, workflow.active_task_id);
-        if (!activeSubtask) {
-            return transitionError(`Active subtask not found: ${workflow.active_task_id}`);
-        }
-
-        const commitSubject = parsed.commitMessage.split("\n")[0]?.trim() || "(empty subject)";
-        ctx.ui.notify(`subtask-commit: commit message detected: ${commitSubject}`, "info");
-        ctx.ui.notify(`subtask-commit: closing task ${activeSubtask.task_id}`, "info");
-
-        const closeSubtask = await tkCloseTask(pi, root, activeSubtask.task_id);
-        if (closeSubtask.ok === false) {
-            return {error: `Failed to close subtask ${activeSubtask.task_id}: ${closeSubtask.error}`};
-        }
-
-        ctx.ui.notify("subtask-commit: running jj commit", "info");
-        const committed = await runJjCommitWithCleanCheck(pi, root, parsed.commitMessage);
-        if (committed.ok === false) {
-            return {error: committed.error};
-        }
-        ctx.ui.notify(`subtask-commit: committed successfully (${commitSubject})`, "info");
-
-        const sibling = nextSibling(workflow, activeSubtask.task_id);
-        if (sibling) {
-            const transitioned = buildTransitionedWorkflow(workflow, {
-                toState: WorkflowState.IMPLEMENT,
-                activeTaskId: sibling.task_id,
-                event: "subtask-commit-next-subtask",
-            });
-            if ("error" in transitioned) return transitionError(transitioned.error);
-            return saveTransition(transitioned.workflow, true);
-        }
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.MANUAL_TEST,
-            activeTaskId: workflow.task_id,
-            event: "subtask-commit-enter-manual-test",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, true);
-    }
-
-    if (workflow.state === WorkflowState.MANUAL_TEST) {
-        return {changed: false, shouldContinue: false, workflow};
-    }
-
-    if (workflow.state === WorkflowState.COMMIT) {
-        if (!parsed.commitMessage) {
-            ctx.ui.notify("commit: waiting for <commit-message>...</commit-message>", "warning");
-            return {changed: false, shouldContinue: false, workflow};
-        }
-
-        const commitSubject = parsed.commitMessage.split("\n")[0]?.trim() || "(empty subject)";
-        ctx.ui.notify(`commit: final commit message detected: ${commitSubject}`, "info");
-        ctx.ui.notify(`commit: closing root task ${workflow.task_id}`, "info");
-
-        const closeRoot = await tkCloseTask(pi, root, workflow.task_id);
-        if (closeRoot.ok === false) {
-            return {error: `Failed to close root task ${workflow.task_id}: ${closeRoot.error}`};
-        }
-
-        ctx.ui.notify("commit: running final jj commit", "info");
-        const committed = await runJjCommitWithCleanCheck(pi, root, parsed.commitMessage);
-        if (committed.ok === false) {
-            return {error: committed.error};
-        }
-        ctx.ui.notify(`commit: final commit succeeded (${commitSubject})`, "info");
-
-        const transitioned = buildTransitionedWorkflow(workflow, {
-            toState: WorkflowState.COMPLETE,
-            activeTaskId: workflow.task_id,
-            event: "commit-complete",
-        });
-        if ("error" in transitioned) return transitionError(transitioned.error);
-        return saveTransition(transitioned.workflow, false);
-    }
-
-    return {changed: false, shouldContinue: false, workflow};
 }
 
 function clearTaskUi(ctx: ExtensionContext): void {
@@ -1154,7 +1135,7 @@ function clearTaskUi(ctx: ExtensionContext): void {
 async function updateTaskUiDisplay(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
-    workflow: Workflow,
+    workflow: PersistedWorkflow,
 ): Promise<void> {
     const rootBase = `${workflow.task_id} - ${workflow.title}`;
     const activeNode = findNodeById(workflow, workflow.active_task_id);
@@ -1174,9 +1155,58 @@ async function updateTaskUiDisplay(
     }
 }
 
+async function maybeNotifyPendingTransitionOutsideTaskLoop(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+): Promise<void> {
+    if (isTaskLoopActive()) {
+        return;
+    }
+
+    const cwd = ctx.sessionManager.getCwd();
+    const jjRootResult = await pi.exec("jj", ["root"], {cwd});
+    if (jjRootResult.code !== 0) {
+        return;
+    }
+
+    const root = jjRootResult.stdout.trim();
+    if (!root || !isTaskWorkspace(root)) {
+        return;
+    }
+
+    const loaded = loadWorkflow(root);
+    if ("error" in loaded) {
+        return;
+    }
+
+    const workflow = loaded.workflow;
+    const latest = getLastAssistantMessage(ctx);
+
+    const shouldNotify = shouldNotifyPendingTransitionOutsideTaskLoop({
+        workflowState: workflow.state,
+        latestAssistantMessageId: latest?.id ?? null,
+        latestAssistantMessageText: latest?.text ?? "",
+        lastConsumedAssistantId: workflow.last_consumed_assistant_id ?? null,
+        taskLoopActive: isTaskLoopActive(),
+    });
+
+    if (!shouldNotify) {
+        return;
+    }
+
+    ctx.ui.notify(
+        "The agent has requested a transition outside the tool loop, please run /task to continue.",
+        "warning",
+    );
+}
+
 export default function (pi: ExtensionAPI) {
     pi.on("agent_start", () => {
         resolveNextAgentStart();
+    });
+
+    pi.on("agent_end", async (_event, ctx) => {
+        await maybeNotifyPendingTransitionOutsideTaskLoop(pi, ctx);
     });
 
     pi.registerCommand("task", {
@@ -1217,7 +1247,7 @@ export default function (pi: ExtensionAPI) {
                     return;
                 }
 
-                await runTaskWorkspace(pi, ctx, root);
+                await withTaskLoopGuard(() => runTaskWorkspace(pi, ctx, root));
             } else {
                 if (subcommand === "lgtm") {
                     ctx.ui.notify("/task lgtm can only be used inside a per-task workspace (~/.workspaces/<task-id>/<repo>).", "error");
@@ -1272,9 +1302,7 @@ function agentEndLooksLikeErrorFromSession(ctx: ExtensionContext): boolean {
  *
  * Usage: /task lgtm
  *
- * Supported states:
- * - review-plan
- * - review
+ * Validity is enforced by the state machine (currently review-plan/review only).
  */
 async function forceLGTM(
     pi: ExtensionAPI,
@@ -1293,29 +1321,17 @@ async function forceLGTM(
     }
 
     const workflow = loaded.workflow;
-    if (workflow.state !== WorkflowState.REVIEW_PLAN && workflow.state !== WorkflowState.REVIEW) {
-        ctx.ui.notify(
-            `/task lgtm is only supported in review-plan or review (current: ${workflow.state}).`,
-            "error",
-        );
-        return false;
-    }
 
-    const noteMessage = workflow.state === WorkflowState.REVIEW_PLAN
-        ? "Forced LGTM via /task lgtm (skipping plan review findings)."
-        : "Forced LGTM via /task lgtm (skipping review findings).";
-
-    // Best effort note.
-    await tkAddNoteBestEffort(pi, root, workflow.active_task_id, noteMessage);
-
-    const result = await dispatchWorkflowEvent(pi, ctx, root, workflow, {type: "force-lgtm"});
+    const result = await dispatchWorkflowEvent(pi, ctx, root, workflow, {
+        type: "FORCE_LGTM",
+        completedState: workflow.state,
+    });
     if ("error" in result) {
         ctx.ui.notify(result.error, "error");
         return false;
     }
 
     if (!result.changed) {
-        ctx.ui.notify(`No workflow transition applied by /task lgtm from ${workflow.state}.`, "warning");
         return false;
     }
 
@@ -1335,11 +1351,6 @@ function getLastAssistantMessage(ctx: ExtensionContext): {id: string | null; tex
         return {id, text: extractMessageText(message.content)};
     }
     return null;
-}
-
-function getLastAssistantMessageText(ctx: ExtensionContext): string | null {
-    const last = getLastAssistantMessage(ctx);
-    return last ? last.text : null;
 }
 
 async function waitForNewAssistantMessage(
@@ -1551,7 +1562,7 @@ async function runTaskWorkspace(
         } else if (
             workflow.session_leaf_id !== leafId
             && workflow.version === 1
-            && workflow.state === WorkflowState.REFINE
+            && workflow.state === "refine"
             && workflow.active_task_id === workflow.task_id
             && workflow.last_transition?.event === "initialize"
         ) {
@@ -1573,25 +1584,39 @@ async function runTaskWorkspace(
             );
         }
 
+        const withSessionFile = persistSessionFilePath(root, workflow, ctx.sessionManager.getSessionFile());
+        if ("error" in withSessionFile) {
+            ctx.ui.notify(`Failed to update workflow session file path: ${withSessionFile.error}`, "error");
+            return;
+        }
+        workflow = withSessionFile.workflow;
+
         await updateTaskUiDisplay(pi, ctx, workflow);
 
-        if (workflow.state === WorkflowState.COMPLETE) {
+        if (workflow.state === "complete") {
             ctx.ui.notify("Workflow already complete. Workspace is ready to merge.", "info");
             return;
         }
 
-        if (workflow.state === WorkflowState.MANUAL_TEST && userConfirmedManualTests(ctx)) {
-            const manualGate = await dispatchWorkflowEvent(pi, ctx, root, workflow, {type: "manual-test-passed"});
+        if (workflow.state === "manual-test" && userConfirmedManualTests(ctx)) {
+            const manualGate = await dispatchWorkflowEvent(pi, ctx, root, workflow, {type: "MANUAL_TESTS_PASSED"});
             if ("error" in manualGate) {
                 ctx.ui.notify(manualGate.error, "error");
                 return;
             }
             if (manualGate.changed) {
-                if (manualGate.shouldContinue) {
-                    continue;
-                }
-                return;
+                continue;
             }
+        }
+
+        const replayed = await replayPendingAssistantTransition(pi, ctx, root, workflow);
+        if ("error" in replayed) {
+            ctx.ui.notify(replayed.error, "error");
+            return;
+        }
+        workflow = replayed.workflow;
+        if (replayed.changed) {
+            continue;
         }
 
         const taskLoad = loadTask(workflow.state, root, agentDir);
@@ -1657,23 +1682,6 @@ async function runTaskWorkspace(
             `- Active Ticket ID: ${workflow.active_task_id}`,
             `- Active Path: ${workflow.active_path_ids.join(" -> ")}`,
             "",
-            "## Workflow Transition Contract",
-            "- The workflow state is managed ONLY by .tasks/workflow.json.",
-            "- Do NOT run `tk header ... task-status ...`.",
-            "- To move refine -> plan, emit: <transition>plan</transition>",
-            "- To move plan -> review-plan, emit: <transition>review-plan</transition>",
-            "- In review-plan emit one of:",
-            "  - <transition>implement</transition>   (approve and start implementation)",
-            "  - <transition>review-plan</transition> (request another review pass)",
-            "- In review, emit one of:",
-            "  - <transition>subtask-commit</transition>  (approve)",
-            "  - <review-findings>...</review-findings> + <transition>implement-review</transition>",
-            `- To pass manual test gate, user must explicitly confirm: ${MANUAL_TEST_PASS_PHRASE} (also accepts: MANUAL TEST PASSED)`,
-            "- Keep using these blocks when appropriate:",
-            "  - <subtasks>...</subtasks>",
-            "  - <review-findings>...</review-findings>",
-            "  - <commit-message>...</commit-message>",
-            "",
             "## Ticket Handling Rules (critical)",
             "- Do NOT manually edit YAML frontmatter in ticket files (`--- ... ---`).",
             "- Do NOT change `status` (open/in_progress/closed) manually.",
@@ -1704,9 +1712,9 @@ async function runTaskWorkspace(
             return;
         }
 
-        const parsed = parseAssistantOutput(ctx, previousAssistantId, workflow.state);
-        if ("error" in parsed) {
-            ctx.ui.notify(parsed.error, "error");
+        const captured = captureAssistantTurnMessage(ctx, previousAssistantId);
+        if ("error" in captured) {
+            ctx.ui.notify(captured.error, "error");
             return;
         }
 
@@ -1716,8 +1724,10 @@ async function runTaskWorkspace(
             root,
             workflow,
             {
-                type: "assistant-turn",
-                parsed: parsed.parsed,
+                type: "COMPLETE",
+                completedState: workflow.state,
+                assistantMessage: captured.assistantMessage,
+                rootTicketMarkdown: "",
             },
         );
 
@@ -1726,15 +1736,31 @@ async function runTaskWorkspace(
             return;
         }
 
+        const consumed = persistConsumedAssistantMessageId(root, transition.workflow, captured.assistantMessageId);
+        if ("error" in consumed) {
+            ctx.ui.notify(consumed.error, "error");
+            return;
+        }
+
+        const completionNotice = completionReadyToMergeNotice({
+            changed: transition.changed,
+            nextState: consumed.workflow.state,
+        });
+        if (completionNotice) {
+            ctx.ui.notify(completionNotice, "info");
+        }
+
+        const shouldContinue = transition.changed && consumed.workflow.state !== "complete";
+
         if (ENABLE_TRANSITION_DEBUG) {
             ctx.ui.notify(
-                `transition-capture: dispatch result changed=${transition.changed ? "yes" : "no"} continue=${transition.shouldContinue ? "yes" : "no"}`,
+                `transition-capture: dispatch result changed=${transition.changed ? "yes" : "no"} continue=${shouldContinue ? "yes" : "no"}`,
                 "info",
             );
         }
 
-        if (!transition.shouldContinue) {
-            if (workflow.state === WorkflowState.MANUAL_TEST) {
+        if (!shouldContinue) {
+            if (consumed.workflow.state === "manual-test") {
                 ctx.ui.notify(`Waiting for explicit user confirmation: ${MANUAL_TEST_PASS_PHRASE} (or MANUAL TEST PASSED). Then run /task again.`, "info");
             }
             return;
@@ -1954,7 +1980,8 @@ async function mergeDoneTaskWorkspace(
         }
     }
 
-    const message = (await ctx.ui.input("Squash merge commit message:", defaultMessage)) || defaultMessage;
+    const messageInput = await ctx.ui.editor("Squash merge commit message:", defaultMessage);
+    const message = resolveEditorPrefillValue(messageInput, defaultMessage);
 
     // Create a single squashed commit after @- containing all task changes.
     // `-A @-` also rebases children of @- (including @) onto the new squashed commit,
@@ -2233,177 +2260,6 @@ function formatReadyTicketLine(ticket: ReadyTicket): string {
     return `${paddedId} [${ticket.status}] - ${ticket.title}`;
 }
 
-function parseTicketIdFromReadyLine(line: string): string {
-    const match = line.match(/\b([a-z]+-[a-z0-9]+)\b/);
-    return match ? match[1] : "";
-}
-
-type PlanSubtask = {
-    title: string;
-    description: string;
-    tdd: boolean;
-};
-
-function normalizeNewlines(value: string): string {
-    return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-
-/**
- * Extract the YAML payload inside a `<subtasks>...</subtasks>` block under the first `## Plan` header.
- *
- * We intentionally don't rely on markdown code fences here because subtask descriptions may contain
- * nested code blocks.
- */
-function extractYamlPlanBlock(ticketMarkdown: string): string | null {
-    const normalized = normalizeNewlines(ticketMarkdown);
-
-    const planHeaderMatch = /^## Plan\s*$/m.exec(normalized);
-    if (!planHeaderMatch) {
-        return null;
-    }
-
-    const afterPlanHeader = normalized.slice(planHeaderMatch.index + planHeaderMatch[0].length);
-
-    // Prefer tag-on-its-own-line parsing (more robust w/ YAML content)
-    const startMatch = /^\s*<subtasks>\s*$/m.exec(afterPlanHeader);
-    if (startMatch) {
-        const afterStartLine = afterPlanHeader.slice(startMatch.index + startMatch[0].length);
-        const firstNewline = afterStartLine.indexOf("\n");
-        const body = firstNewline === -1 ? "" : afterStartLine.slice(firstNewline + 1);
-
-        const endMatch = /^\s*<\/subtasks>\s*$/m.exec(body);
-        if (!endMatch) {
-            return null;
-        }
-        return body.slice(0, endMatch.index).trim();
-    }
-
-    // Fallback: allow inline tags (e.g. <subtasks>...yaml...</subtasks>)
-    const startIdx = afterPlanHeader.indexOf("<subtasks>");
-    if (startIdx === -1) return null;
-    const endIdx = afterPlanHeader.indexOf("</subtasks>", startIdx + "<subtasks>".length);
-    if (endIdx === -1) return null;
-    return afterPlanHeader.slice(startIdx + "<subtasks>".length, endIdx).trim();
-}
-
-function parseYamlDocument(yamlString: string): unknown {
-    const wrapped = `---\n${yamlString}\n---`;
-    return parseFrontmatter(wrapped).frontmatter as unknown;
-}
-
-/**
- * Parse the plan subtasks YAML from a ticket markdown file.
- *
- * Expected format (see agent/task/plan.md):
- *
- * ## Plan
- * <subtasks>
- * - title: "..."
- *   description: |
- *     ...
- *   tdd: false
- * </subtasks>
- */
-function parsePlanSubtasksFromTicketMarkdown(
-    ticketMarkdown: string,
-): { subtasks: PlanSubtask[] } | { error: string } {
-    const yamlString = extractYamlPlanBlock(ticketMarkdown);
-    if (!yamlString) {
-        return {error: "Could not find a `## Plan` section with a <subtasks>...</subtasks> block."};
-    }
-
-    return parseYamlTicketList(yamlString, "Subtask");
-}
-
-function extractTaggedYamlBlock(text: string, tagName: string): string | null {
-    const normalized = normalizeNewlines(text);
-
-    // Prefer tag-on-its-own-line parsing.
-    const startMatch = new RegExp(`^\\s*<${tagName}>\\s*$`, "m").exec(normalized);
-    if (startMatch) {
-        const afterStart = normalized.slice(startMatch.index + startMatch[0].length);
-        const firstNewline = afterStart.indexOf("\n");
-        const body = firstNewline === -1 ? "" : afterStart.slice(firstNewline + 1);
-
-        const endMatch = new RegExp(`^\\s*</${tagName}>\\s*$`, "m").exec(body);
-        if (!endMatch) return null;
-        return body.slice(0, endMatch.index).trim();
-    }
-
-    // Fallback: allow inline tags.
-    const startIdx = normalized.indexOf(`<${tagName}>`);
-    if (startIdx === -1) return null;
-    const endIdx = normalized.indexOf(`</${tagName}>`, startIdx + tagName.length + 2);
-    if (endIdx === -1) return null;
-    return normalized.slice(startIdx + tagName.length + 2, endIdx).trim();
-}
-
-function parseYamlTicketList(
-    yamlString: string,
-    label: string,
-): { subtasks: PlanSubtask[] } | { error: string } {
-    let parsed: unknown;
-    try {
-        parsed = parseYamlDocument(yamlString);
-    } catch (e) {
-        return {error: `Failed to parse ${label} YAML block: ${e}`};
-    }
-
-    if (!parsed) {
-        return {subtasks: []};
-    }
-
-    if (!Array.isArray(parsed)) {
-        return {error: `${label} YAML block must be a list (a YAML sequence).`};
-    }
-
-    const subtasks: PlanSubtask[] = [];
-    for (let i = 0; i < parsed.length; i++) {
-        const item = parsed[i];
-        if (!item || typeof item !== "object") {
-            return {error: `${label} ${i + 1} is not an object.`};
-        }
-
-        const title = typeof (item as { title?: unknown }).title === "string" ? (item as {
-            title: string
-        }).title.trim() : "";
-        const description =
-            typeof (item as { description?: unknown }).description === "string"
-                ? (item as { description: string }).description
-                : "";
-        const tddValue = (item as { tdd?: unknown }).tdd;
-        const tdd = typeof tddValue === "boolean" ? tddValue : true;
-
-        if (!title) {
-            return {error: `${label} ${i + 1} is missing a non-empty string 'title'.`};
-        }
-
-        subtasks.push({title, description, tdd});
-    }
-
-    return {subtasks};
-}
-
-function parseReviewFindingsFromAssistantMessage(
-    messageText: string,
-): { findings: PlanSubtask[] } | { error: string } | null {
-    const yamlString = extractTaggedYamlBlock(messageText, "review-findings");
-    if (!yamlString) return null;
-
-    const parsed = parseYamlTicketList(yamlString, "Finding");
-    if ("error" in parsed) return parsed;
-    return {findings: parsed.subtasks};
-}
-
-function parseCommitMessageFromAssistantMessage(messageText: string): string | null {
-    const raw = extractTaggedYamlBlock(messageText, "commit-message");
-    if (!raw) return null;
-
-    // Preserve multi-line messages (subject + body). Trim outer whitespace only.
-    const normalized = normalizeNewlines(raw).trim();
-    return normalized.length > 0 ? normalized : null;
-}
-
 async function loadTicketMarkdown(pi: ExtensionAPI, cwd: string, id: string): Promise<{ content: string } | {
     error: string
 }> {
@@ -2598,7 +2454,8 @@ async function selectAndStartTask(
 
     // Create slug from title
     const slugDefault = slugify(ticketTitle);
-    const slug = await ctx.ui.input(`Task slug (default: ${slugDefault}):`, slugDefault) || slugDefault;
+    const slugInput = await ctx.ui.editor("Task slug:", slugDefault);
+    const slug = resolveEditorPrefillValue(slugInput, slugDefault, {singleLine: true});
 
     // Create task ID with timestamp (needed for commit message)
     const taskId = `${formatTaskIdTimestamp(new Date())}-${slug}`;
