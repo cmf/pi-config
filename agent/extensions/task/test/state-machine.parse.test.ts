@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import {canReplayCompleteFromAssistantMessage, parseAssistantOutput} from "../state-machine.js";
+import {
+    canReplayCompleteFromAssistantMessage,
+    eventNeedsRootIssueMarkdown,
+    parseAssistantOutput,
+    type WorkflowEvent,
+    type WorkflowSnapshot,
+} from "../state-machine.js";
 
 function expectParsed(result: ReturnType<typeof parseAssistantOutput>) {
     assert.ok("parsed" in result, `Expected parsed result, got error: ${"error" in result ? result.error : "unknown"}`);
@@ -11,6 +17,25 @@ function expectParsed(result: ReturnType<typeof parseAssistantOutput>) {
 function expectError(result: ReturnType<typeof parseAssistantOutput>) {
     assert.ok("error" in result, "Expected error result");
     return result.error;
+}
+
+function makeSnapshot(state: WorkflowSnapshot["state"]): WorkflowSnapshot {
+    return {
+        state,
+        rootTaskId: "TASK-ROOT",
+        activeTaskId: "TASK-ROOT",
+        activeTaskParentId: null,
+        activeTaskNextSiblingId: null,
+    };
+}
+
+function completeEvent(completedState: WorkflowSnapshot["state"]): WorkflowEvent {
+    return {
+        type: "COMPLETE",
+        completedState,
+        assistantMessage: "",
+        rootIssueMarkdown: "",
+    };
 }
 
 test("parseAssistantOutput picks the last valid transition tag", () => {
@@ -159,6 +184,20 @@ false
 
     assert.equal(parsed.requestedState, "implement-review");
     assert.deepEqual(parsed.reviewFindings, []);
+});
+
+test("eventNeedsRootIssueMarkdown requests root markdown for commit COMPLETE events", () => {
+    assert.equal(
+        eventNeedsRootIssueMarkdown(makeSnapshot("commit"), completeEvent("commit")),
+        true,
+    );
+});
+
+test("eventNeedsRootIssueMarkdown does not request root markdown for subtask-commit COMPLETE events", () => {
+    assert.equal(
+        eventNeedsRootIssueMarkdown(makeSnapshot("subtask-commit"), completeEvent("subtask-commit")),
+        false,
+    );
 });
 
 test("canReplayCompleteFromAssistantMessage returns true for refine->plan transition tag", () => {

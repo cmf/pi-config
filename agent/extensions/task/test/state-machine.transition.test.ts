@@ -40,6 +40,28 @@ const INLINE_PLAN_MARKDOWN = `
   description: Inline fallback parser path</subtasks>
 `;
 
+const ROOT_DESCRIPTION_WITH_FIXES_MARKDOWN = `
+# Root
+
+Implement deterministic task close behavior.
+Fixes: owner/repo#123
+
+## Plan
+<subtasks>
+- title: Implement parser
+  description: Add parser behavior
+</subtasks>
+`;
+
+const ROOT_SECTION_WITH_FIXES_MARKDOWN = `
+# Root
+
+Implement deterministic task close behavior.
+
+## Summary of Changes
+Fixes: owner/repo#123
+`;
+
 function makeSnapshot(state: WorkflowState, overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
     return {
         state,
@@ -54,9 +76,9 @@ function makeSnapshot(state: WorkflowState, overrides: Partial<WorkflowSnapshot>
 function complete(
     completedState: WorkflowState,
     assistantMessage = "",
-    rootTicketMarkdown = "",
+    rootIssueMarkdown = "",
 ): WorkflowEvent {
-    return {type: "COMPLETE", completedState, assistantMessage, rootTicketMarkdown};
+    return {type: "COMPLETE", completedState, assistantMessage, rootIssueMarkdown};
 }
 
 function expectKind<TKind extends TransitionDecision["kind"]>(
@@ -114,7 +136,7 @@ test("plan: rejects review-plan transition when root markdown is missing", () =>
     );
 
     expectKind(decision, "rejected");
-    assert.equal(decision.reason, "Cannot move to review-plan: Root ticket markdown is required.");
+    assert.equal(decision.reason, "Cannot move to review-plan: Root issue markdown is required.");
 });
 
 test("plan: rejects review-plan transition when plan subtasks are empty", () => {
@@ -126,7 +148,7 @@ test("plan: rejects review-plan transition when plan subtasks are empty", () => 
     expectKind(decision, "rejected");
     assert.equal(
         decision.reason,
-        "Expected non-empty ## Plan/<subtasks>...</subtasks> in root ticket before moving to review-plan",
+        "Expected non-empty ## Plan/<subtasks>...</subtasks> in root issue before moving to review-plan",
     );
 });
 
@@ -184,7 +206,7 @@ test("review-plan: rejects re-review when plan subtasks are empty", () => {
     );
 
     expectKind(decision, "rejected");
-    assert.equal(decision.reason, "Cannot re-review: no plan subtasks found in root ticket markdown");
+    assert.equal(decision.reason, "Cannot re-review: no plan subtasks found in root issue markdown");
 });
 
 test("review-plan: rejects implement transition when plan block is missing", () => {
@@ -207,7 +229,7 @@ test("review-plan: rejects implement transition when plan subtasks are empty", (
     );
 
     expectKind(decision, "rejected");
-    assert.equal(decision.reason, "Cannot approve plan: no plan subtasks found in root ticket markdown");
+    assert.equal(decision.reason, "Cannot approve plan: no plan subtasks found in root issue markdown");
 });
 
 test("review-plan: rejects unexpected transition tags", () => {
@@ -234,14 +256,14 @@ test("review-plan: approval creates subtasks and moves to implement", () => {
     assert.deepEqual(decision.activeTaskTarget, {type: "first-created-child", parentTaskId: ROOT});
     assert.deepEqual(decision.effects, [
         {
-            type: "CREATE_TICKET",
+            type: "CREATE_ISSUE",
             parentTaskId: ROOT,
             title: "Implement parser",
             description: "Add parser behavior",
             idempotencyKey: `${ROOT}::Implement parser`,
         },
         {
-            type: "CREATE_TICKET",
+            type: "CREATE_ISSUE",
             parentTaskId: ROOT,
             title: "Add tests",
             description: "Cover edge cases",
@@ -256,7 +278,7 @@ test("review-plan: force LGTM creates subtasks and appends note", () => {
         {
             type: "FORCE_LGTM",
             completedState: "review-plan",
-            rootTicketMarkdown: VALID_PLAN_MARKDOWN,
+            rootIssueMarkdown: VALID_PLAN_MARKDOWN,
         },
     );
 
@@ -265,14 +287,14 @@ test("review-plan: force LGTM creates subtasks and appends note", () => {
     assert.deepEqual(decision.activeTaskTarget, {type: "first-created-child", parentTaskId: ROOT});
     assert.deepEqual(decision.effects, [
         {
-            type: "CREATE_TICKET",
+            type: "CREATE_ISSUE",
             parentTaskId: ROOT,
             title: "Implement parser",
             description: "Add parser behavior",
             idempotencyKey: `${ROOT}::Implement parser`,
         },
         {
-            type: "CREATE_TICKET",
+            type: "CREATE_ISSUE",
             parentTaskId: ROOT,
             title: "Add tests",
             description: "Cover edge cases",
@@ -296,7 +318,7 @@ test("review-plan: rejects force LGTM when plan markdown is missing", () => {
     );
 
     expectKind(decision, "rejected");
-    assert.equal(decision.reason, "Cannot force approval: Root ticket markdown is required.");
+    assert.equal(decision.reason, "Cannot force approval: Root issue markdown is required.");
 });
 
 test("review-plan: rejects force LGTM when plan subtasks are empty", () => {
@@ -305,12 +327,12 @@ test("review-plan: rejects force LGTM when plan subtasks are empty", () => {
         {
             type: "FORCE_LGTM",
             completedState: "review-plan",
-            rootTicketMarkdown: EMPTY_PLAN_MARKDOWN,
+            rootIssueMarkdown: EMPTY_PLAN_MARKDOWN,
         },
     );
 
     expectKind(decision, "rejected");
-    assert.equal(decision.reason, "Cannot force approval: no plan subtasks found in root ticket markdown");
+    assert.equal(decision.reason, "Cannot force approval: no plan subtasks found in root issue markdown");
 });
 
 test("implement: always advances to review", () => {
@@ -348,7 +370,7 @@ test("review: rejects no transition and no findings", () => {
     );
 });
 
-test("review: findings + implement-review transition creates child finding tickets", () => {
+test("review: findings + implement-review transition creates child finding issues", () => {
     const decision = transition(
         makeSnapshot("review", {activeTaskId: SUBTASK, activeTaskParentId: ROOT}),
         complete(
@@ -370,14 +392,14 @@ test("review: findings + implement-review transition creates child finding ticke
     assert.deepEqual(decision.activeTaskTarget, {type: "first-created-child", parentTaskId: SUBTASK});
     assert.deepEqual(decision.effects, [
         {
-            type: "CREATE_TICKET",
+            type: "CREATE_ISSUE",
             parentTaskId: SUBTASK,
             title: "Fix edge case",
             description: "Handle nil input",
             idempotencyKey: `${SUBTASK}::Fix edge case`,
         },
         {
-            type: "CREATE_TICKET",
+            type: "CREATE_ISSUE",
             parentTaskId: SUBTASK,
             title: "Add test",
             description: "Ensure regression coverage",
@@ -460,7 +482,7 @@ test("implement-review: moves to next sibling finding when present", () => {
     expectKind(decision, "applied");
     assert.equal(decision.state, "implement-review");
     assert.deepEqual(decision.activeTaskTarget, {type: "next-sibling"});
-    assert.deepEqual(decision.effects, [{type: "CLOSE_TICKET", taskId: FINDING}]);
+    assert.deepEqual(decision.effects, [{type: "CLOSE_ISSUE", taskId: FINDING}]);
 });
 
 test("implement-review: returns to parent review when there is no next sibling", () => {
@@ -476,7 +498,7 @@ test("implement-review: returns to parent review when there is no next sibling",
     expectKind(decision, "applied");
     assert.equal(decision.state, "review");
     assert.deepEqual(decision.activeTaskTarget, {type: "parent"});
-    assert.deepEqual(decision.effects, [{type: "CLOSE_TICKET", taskId: FINDING}]);
+    assert.deepEqual(decision.effects, [{type: "CLOSE_ISSUE", taskId: FINDING}]);
 });
 
 test("subtask-commit: rejects when commit message is missing", () => {
@@ -512,7 +534,7 @@ details
     assert.equal(decision.state, "implement");
     assert.deepEqual(decision.activeTaskTarget, {type: "next-sibling"});
     assert.deepEqual(decision.effects, [
-        {type: "CLOSE_TICKET", taskId: SUBTASK},
+        {type: "CLOSE_ISSUE", taskId: SUBTASK},
         {type: "RUN_JJ_COMMIT", message: "feat: complete subtask\n\ndetails"},
     ]);
 });
@@ -564,7 +586,7 @@ test("commit: requires commit message", () => {
     assert.equal(decision.reason, "Expected <commit-message>...</commit-message>");
 });
 
-test("commit: closes root ticket and moves workflow to complete", () => {
+test("commit: closes root issue and moves workflow to complete", () => {
     const decision = transition(
         makeSnapshot("commit"),
         complete("commit", "<commit-message>feat: finalize workflow</commit-message>"),
@@ -574,8 +596,82 @@ test("commit: closes root ticket and moves workflow to complete", () => {
     assert.equal(decision.state, "complete");
     assert.deepEqual(decision.activeTaskTarget, {type: "root"});
     assert.deepEqual(decision.effects, [
-        {type: "CLOSE_TICKET", taskId: ROOT},
+        {type: "CLOSE_ISSUE", taskId: ROOT},
         {type: "RUN_JJ_COMMIT", message: "feat: finalize workflow"},
+    ]);
+});
+
+test("commit: appends Fixes line from root description to multiline final commit", () => {
+    const decision = transition(
+        makeSnapshot("commit"),
+        complete(
+            "commit",
+            "<commit-message>feat: finalize workflow\n\nSummary body</commit-message>",
+            ROOT_DESCRIPTION_WITH_FIXES_MARKDOWN,
+        ),
+    );
+
+    expectKind(decision, "applied");
+    assert.deepEqual(decision.effects, [
+        {type: "CLOSE_ISSUE", taskId: ROOT},
+        {
+            type: "RUN_JJ_COMMIT",
+            message: "feat: finalize workflow\n\nSummary body\n\nFixes: owner/repo#123",
+        },
+    ]);
+});
+
+test("commit: does not append Fixes line for single-line final commit message", () => {
+    const decision = transition(
+        makeSnapshot("commit"),
+        complete(
+            "commit",
+            "<commit-message>feat: finalize workflow</commit-message>",
+            ROOT_DESCRIPTION_WITH_FIXES_MARKDOWN,
+        ),
+    );
+
+    expectKind(decision, "applied");
+    assert.deepEqual(decision.effects, [
+        {type: "CLOSE_ISSUE", taskId: ROOT},
+        {type: "RUN_JJ_COMMIT", message: "feat: finalize workflow"},
+    ]);
+});
+
+test("commit: does not duplicate Fixes line if already present in commit message", () => {
+    const decision = transition(
+        makeSnapshot("commit"),
+        complete(
+            "commit",
+            "<commit-message>feat: finalize workflow\n\nSummary body\n\nFixes: owner/repo#123</commit-message>",
+            ROOT_DESCRIPTION_WITH_FIXES_MARKDOWN,
+        ),
+    );
+
+    expectKind(decision, "applied");
+    assert.deepEqual(decision.effects, [
+        {type: "CLOSE_ISSUE", taskId: ROOT},
+        {
+            type: "RUN_JJ_COMMIT",
+            message: "feat: finalize workflow\n\nSummary body\n\nFixes: owner/repo#123",
+        },
+    ]);
+});
+
+test("commit: only considers Fixes line from root description (not later sections)", () => {
+    const decision = transition(
+        makeSnapshot("commit"),
+        complete(
+            "commit",
+            "<commit-message>feat: finalize workflow\n\nSummary body</commit-message>",
+            ROOT_SECTION_WITH_FIXES_MARKDOWN,
+        ),
+    );
+
+    expectKind(decision, "applied");
+    assert.deepEqual(decision.effects, [
+        {type: "CLOSE_ISSUE", taskId: ROOT},
+        {type: "RUN_JJ_COMMIT", message: "feat: finalize workflow\n\nSummary body"},
     ]);
 });
 
@@ -595,7 +691,7 @@ test("rejects stale COMPLETE and FORCE_LGTM events", () => {
     const staleForce = transition(makeSnapshot("review"), {
         type: "FORCE_LGTM",
         completedState: "plan",
-        rootTicketMarkdown: VALID_PLAN_MARKDOWN,
+        rootIssueMarkdown: VALID_PLAN_MARKDOWN,
     });
     expectKind(staleForce, "rejected");
     assert.equal(staleForce.reason, "Stale FORCE_LGTM event for a different state");
@@ -605,7 +701,7 @@ test("FORCE_LGTM is rejected in unsupported states", () => {
     const decision = transition(makeSnapshot("refine"), {
         type: "FORCE_LGTM",
         completedState: "refine",
-        rootTicketMarkdown: VALID_PLAN_MARKDOWN,
+        rootIssueMarkdown: VALID_PLAN_MARKDOWN,
     });
 
     expectKind(decision, "rejected");

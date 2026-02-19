@@ -1,8 +1,15 @@
 {
-  "lastChangelogVersion": "0.52.9",
+  "lastChangelogVersion": "0.53.0",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.3-codex",
-  "defaultThinkingLevel": "high",
-  "packages": [],
-  "hideThinkingBlock": false
+  "defaultThinkingLevel": "medium",
+  "packages": [
+    "npm:@aliou/pi-processes"
+  ],
+  "hideThinkingBlock": false,
+  "enabledModels": [
+    "openai-codex/gpt-5.3-codex",
+    "openai-codex/gpt-5.3-codex-spark",
+    "anthropic/claude-opus-4-6"
+  ]
 }

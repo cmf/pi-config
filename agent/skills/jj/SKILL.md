@@ -31,6 +31,7 @@ jj commit -m "message"
 - **Change IDs** are stable across rewrites; **Commit IDs** change with content.
 - **Conflicts don’t block**; can resolve later.
 - **Operations log** enables undo/redo and full repo restore.
+- **Ignore files:** use `.gitignore` (and `.ignore` where needed). Do **not** assume `.jjignore` exists.
 
 ## Essential Commands
 ```bash

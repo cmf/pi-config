@@ -38,16 +38,16 @@ export type WorkflowEvent =
     | {
     type: "COMPLETE";
     completedState: WorkflowState;
-    rootTicketMarkdown: string;
+    rootIssueMarkdown: string;
     assistantMessage: string;
 }
     | {
     type: "FORCE_LGTM";
     completedState: WorkflowState;
     /**
-     * Root ticket markdown at time of force. Required in review-plan.
+     * Root issue markdown at time of force. Required in review-plan.
      */
-    rootTicketMarkdown?: string;
+    rootIssueMarkdown?: string;
 }
     | {
     type: "MANUAL_TESTS_PASSED";
@@ -55,12 +55,12 @@ export type WorkflowEvent =
 
 export type WorkflowEffect =
     | {
-    type: "CREATE_TICKET";
+    type: "CREATE_ISSUE";
     parentTaskId: string;
     title: string;
     description: string;
     /**
-     * Idempotency key used by the shell/interpreter to avoid duplicate tickets.
+     * Idempotency key used by the shell/interpreter to avoid duplicate issues.
      * Suggested semantics: unique on (parentTaskId, title).
      */
     idempotencyKey: string;
@@ -71,7 +71,7 @@ export type WorkflowEffect =
     note: string;
 }
     | {
-    type: "CLOSE_TICKET";
+    type: "CLOSE_ISSUE";
     taskId: string;
 }
     | {
@@ -86,7 +86,7 @@ export type ActiveTaskTarget =
     | { type: "next-sibling" }
     | { type: "first-created-child"; parentTaskId: string };
 
-export type TicketDraft = {
+export type IssueDraft = {
     title: string;
     description: string;
     tdd: boolean;
@@ -143,7 +143,7 @@ export type TransitionDecision =
 
 export interface ParsedAssistantOutput {
     requestedState: WorkflowState | null;
-    reviewFindings: TicketDraft[];
+    reviewFindings: IssueDraft[];
     commitMessage: string | null;
 }
 
@@ -157,7 +157,7 @@ export function parseAssistantOutput(
 ): ParsedAssistantOutputResult {
     const shouldParseReviewFindings = state === undefined || state === "review";
     const reviewFindingsResult = shouldParseReviewFindings
-        ? parseTicketDraftListFromTag(message, "review-findings")
+        ? parseIssueDraftListFromTag(message, "review-findings")
         : null;
 
     if (reviewFindingsResult && "error" in reviewFindingsResult) {
@@ -214,7 +214,7 @@ export function isWorkflowState(value: string): value is WorkflowState {
 /**
  * Validates persisted active-path depth against a workflow state.
  * Depth semantics:
- * - 0 => root ticket
+ * - 0 => root issue
  * - 1 => root child (subtask)
  * - 2 => root child child (review-finding implementation)
  */
@@ -244,16 +244,20 @@ export function stateAllowsActiveDepth(state: WorkflowState, depth: number): boo
 }
 
 /**
- * Indicates whether the shell should enrich an event with root ticket markdown
+ * Indicates whether the shell should enrich an event with root issue markdown
  * before passing it through `transition`.
  */
-export function eventNeedsRootTicketMarkdown(
+export function eventNeedsRootIssueMarkdown(
     snapshot: WorkflowSnapshot,
     event: WorkflowEvent,
 ): boolean {
     if (event.type === "COMPLETE") {
         return event.completedState === snapshot.state
-            && (snapshot.state === "plan" || snapshot.state === "review-plan");
+            && (
+                snapshot.state === "plan"
+                || snapshot.state === "review-plan"
+                || snapshot.state === "commit"
+            );
     }
 
     if (event.type === "FORCE_LGTM") {
@@ -281,13 +285,13 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
 
         switch (snapshot.state) {
             case "review-plan": {
-                const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                const planSubtasksResult = parsePlanSubtasksFromRootIssueMarkdown(event.rootIssueMarkdown);
                 if ("error" in planSubtasksResult) {
                     return error(snapshot, event, `Cannot force approval: ${planSubtasksResult.error}`);
                 }
 
                 if (planSubtasksResult.drafts.length === 0) {
-                    return error(snapshot, event, "Cannot force approval: no plan subtasks found in root ticket markdown");
+                    return error(snapshot, event, "Cannot force approval: no plan subtasks found in root issue markdown");
                 }
 
                 return move(
@@ -295,7 +299,7 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                     "implement",
                     {type: "first-created-child", parentTaskId: snapshot.rootTaskId},
                     [
-                        ...toCreateTicketEffects(snapshot.rootTaskId, planSubtasksResult.drafts),
+                        ...toCreateIssueEffects(snapshot.rootTaskId, planSubtasksResult.drafts),
                         {
                             type: "ADD_NOTE",
                             taskId: snapshot.activeTaskId,
@@ -348,7 +352,7 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                 case null:
                     return ignored(snapshot, event) // Interactive turns
                 case "review-plan": {
-                    const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                    const planSubtasksResult = parsePlanSubtasksFromRootIssueMarkdown(event.rootIssueMarkdown);
                     if ("error" in planSubtasksResult) {
                         return error(snapshot, event, `Cannot move to review-plan: ${planSubtasksResult.error}`);
                     }
@@ -357,7 +361,7 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                         return error(
                             snapshot,
                             event,
-                            "Expected non-empty ## Plan/<subtasks>...</subtasks> in root ticket before moving to review-plan",
+                            "Expected non-empty ## Plan/<subtasks>...</subtasks> in root issue before moving to review-plan",
                         );
                     }
 
@@ -374,32 +378,32 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                     return ignored(snapshot, event) // Interactive turns
 
                 case "review-plan": {
-                    const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                    const planSubtasksResult = parsePlanSubtasksFromRootIssueMarkdown(event.rootIssueMarkdown);
                     if ("error" in planSubtasksResult) {
                         return error(snapshot, event, `Cannot re-review: ${planSubtasksResult.error}`);
                     }
 
                     if (planSubtasksResult.drafts.length === 0) {
-                        return error(snapshot, event, "Cannot re-review: no plan subtasks found in root ticket markdown");
+                        return error(snapshot, event, "Cannot re-review: no plan subtasks found in root issue markdown");
                     }
                     return stay(snapshot);
                 }
 
                 case "implement": {
-                    const planSubtasksResult = parsePlanSubtasksFromRootTicketMarkdown(event.rootTicketMarkdown);
+                    const planSubtasksResult = parsePlanSubtasksFromRootIssueMarkdown(event.rootIssueMarkdown);
                     if ("error" in planSubtasksResult) {
                         return error(snapshot, event, `Cannot approve plan: ${planSubtasksResult.error}`);
                     }
 
                     if (planSubtasksResult.drafts.length === 0) {
-                        return error(snapshot, event, "Cannot approve plan: no plan subtasks found in root ticket markdown");
+                        return error(snapshot, event, "Cannot approve plan: no plan subtasks found in root issue markdown");
                     }
 
                     return move(
                         snapshot,
                         "implement",
                         {type: "first-created-child", parentTaskId: snapshot.rootTaskId},
-                        toCreateTicketEffects(snapshot.rootTaskId, planSubtasksResult.drafts),
+                        toCreateIssueEffects(snapshot.rootTaskId, planSubtasksResult.drafts),
                     );
                 }
 
@@ -434,7 +438,7 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                         snapshot,
                         "implement-review",
                         {type: "first-created-child", parentTaskId: snapshot.activeTaskId},
-                        toCreateTicketEffects(snapshot.activeTaskId, parsed.reviewFindings),
+                        toCreateIssueEffects(snapshot.activeTaskId, parsed.reviewFindings),
                     );
                 }
 
@@ -452,7 +456,7 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                 return error(snapshot, event, "implement-review requires activeTaskParentId in snapshot");
             }
 
-            const effects: WorkflowEffect[] = [{type: "CLOSE_TICKET", taskId: snapshot.activeTaskId}];
+            const effects: WorkflowEffect[] = [{type: "CLOSE_ISSUE", taskId: snapshot.activeTaskId}];
 
             if (snapshot.activeTaskNextSiblingId) {
                 return move(snapshot, "implement-review", {type: "next-sibling"}, effects);
@@ -467,7 +471,7 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
             }
 
             const effects: WorkflowEffect[] = [
-                {type: "CLOSE_TICKET", taskId: snapshot.activeTaskId},
+                {type: "CLOSE_ISSUE", taskId: snapshot.activeTaskId},
                 {type: "RUN_JJ_COMMIT", message: parsed.commitMessage},
             ];
 
@@ -491,9 +495,14 @@ export function transition(snapshot: WorkflowSnapshot, event: WorkflowEvent): Tr
                 return error(snapshot, event, "Expected <commit-message>...</commit-message>");
             }
 
+            const finalCommitMessage = appendFixesLineFromRootDescription(
+                parsed.commitMessage,
+                event.rootIssueMarkdown,
+            );
+
             return move(snapshot, "complete", {type: "root"}, [
-                {type: "CLOSE_TICKET", taskId: snapshot.rootTaskId},
-                {type: "RUN_JJ_COMMIT", message: parsed.commitMessage},
+                {type: "CLOSE_ISSUE", taskId: snapshot.rootTaskId},
+                {type: "RUN_JJ_COMMIT", message: finalCommitMessage},
             ]);
         }
 
@@ -550,9 +559,9 @@ function error(snapshot: WorkflowSnapshot, event: WorkflowEvent, reason?: string
     };
 }
 
-function toCreateTicketEffects(parentTaskId: string, drafts: TicketDraft[]): WorkflowEffect[] {
+function toCreateIssueEffects(parentTaskId: string, drafts: IssueDraft[]): WorkflowEffect[] {
     return drafts.map((draft) => ({
-        type: "CREATE_TICKET" as const,
+        type: "CREATE_ISSUE" as const,
         parentTaskId,
         title: draft.title,
         description: draft.description,
@@ -572,30 +581,30 @@ function parseRequestedStateFromAssistantMessage(messageText: string): WorkflowS
 }
 
 type DraftListParseResult =
-    | { drafts: TicketDraft[] }
+    | { drafts: IssueDraft[] }
     | { error: string };
 
-function parsePlanSubtasksFromRootTicketMarkdown(rootTicketMarkdown?: string): DraftListParseResult {
-    if (!rootTicketMarkdown) {
-        return {error: "Root ticket markdown is required."};
+function parsePlanSubtasksFromRootIssueMarkdown(rootIssueMarkdown?: string): DraftListParseResult {
+    if (!rootIssueMarkdown) {
+        return {error: "Root issue markdown is required."};
     }
 
-    const yaml = extractYamlPlanBlock(rootTicketMarkdown);
+    const yaml = extractYamlPlanBlock(rootIssueMarkdown);
     if (!yaml) {
         return {error: "Could not find a `## Plan` section with a <subtasks>...</subtasks> block."};
     }
 
-    return parseYamlTicketList(yaml, "Subtask");
+    return parseYamlIssueList(yaml, "Subtask");
 }
 
-function parseTicketDraftListFromTag(text: string, tagName: "review-findings"): DraftListParseResult | null {
+function parseIssueDraftListFromTag(text: string, tagName: "review-findings"): DraftListParseResult | null {
     const yamlString = extractTaggedYamlBlock(text, tagName);
     if (!yamlString) return null;
 
-    return parseYamlTicketList(yamlString, "Finding");
+    return parseYamlIssueList(yamlString, "Finding");
 }
 
-function parseYamlTicketList(yamlString: string, label: string): DraftListParseResult {
+function parseYamlIssueList(yamlString: string, label: string): DraftListParseResult {
     let parsed: unknown;
     try {
         parsed = parseYamlDocument(yamlString);
@@ -611,7 +620,7 @@ function parseYamlTicketList(yamlString: string, label: string): DraftListParseR
         return {error: `${label} YAML block must be a list (a YAML sequence).`};
     }
 
-    const drafts: TicketDraft[] = [];
+    const drafts: IssueDraft[] = [];
 
     for (let i = 0; i < parsed.length; i++) {
         const item = parsed[i];
@@ -643,8 +652,8 @@ function parseYamlTicketList(yamlString: string, label: string): DraftListParseR
 /**
  * Extract YAML inside <subtasks>...</subtasks> under the first ## Plan section.
  */
-function extractYamlPlanBlock(ticketMarkdown: string): string | null {
-    const normalized = normalizeNewlines(ticketMarkdown);
+function extractYamlPlanBlock(issueMarkdown: string): string | null {
+    const normalized = normalizeNewlines(issueMarkdown);
 
     const planHeaderMatch = /^## Plan\s*$/m.exec(normalized);
     if (!planHeaderMatch) return null;
@@ -674,6 +683,71 @@ function parseCommitMessageFromAssistantMessage(messageText: string): string | n
     if (!raw) return null;
     const normalized = normalizeNewlines(raw).trim();
     return normalized.length > 0 ? normalized : null;
+}
+
+function appendFixesLineFromRootDescription(commitMessage: string, rootIssueMarkdown: string): string {
+    const normalizedCommitMessage = normalizeNewlines(commitMessage).trim();
+    if (!normalizedCommitMessage.includes("\n")) {
+        return normalizedCommitMessage;
+    }
+
+    const fixesReference = extractFixesReferenceFromRootDescription(rootIssueMarkdown);
+    if (!fixesReference) {
+        return normalizedCommitMessage;
+    }
+
+    if (commitMessageAlreadyContainsFixesReference(normalizedCommitMessage, fixesReference)) {
+        return normalizedCommitMessage;
+    }
+
+    return `${normalizedCommitMessage}\n\nFixes: ${fixesReference}`;
+}
+
+function extractFixesReferenceFromRootDescription(rootIssueMarkdown: string): string | null {
+    const description = extractRootIssueDescription(rootIssueMarkdown);
+    if (!description) {
+        return null;
+    }
+
+    for (const line of description.split("\n")) {
+        const match = /^\s*fixes:\s*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+)\s*$/i.exec(line);
+        if (match) {
+            return match[1];
+        }
+    }
+
+    return null;
+}
+
+function extractRootIssueDescription(rootIssueMarkdown: string): string {
+    const normalized = normalizeNewlines(rootIssueMarkdown ?? "").trim();
+    if (!normalized) {
+        return "";
+    }
+
+    let content = normalized;
+    const firstLineEnd = content.indexOf("\n");
+    const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
+    if (/^#\s+/.test(firstLine.trim())) {
+        content = firstLineEnd === -1 ? "" : content.slice(firstLineEnd + 1).trimStart();
+    }
+
+    const firstSection = /^##\s+/m.exec(content);
+    if (!firstSection) {
+        return content.trim();
+    }
+
+    return content.slice(0, firstSection.index).trim();
+}
+
+function commitMessageAlreadyContainsFixesReference(commitMessage: string, fixesReference: string): boolean {
+    const escaped = escapeRegExp(fixesReference);
+    const regex = new RegExp(`^\\s*fixes:\\s*${escaped}\\s*$`, "im");
+    return regex.test(commitMessage);
+}
+
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function extractTaggedYamlBlock(text: string, tagName: string): string | null {

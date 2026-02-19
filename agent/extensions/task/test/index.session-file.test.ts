@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+    buildTaskBranchRevsetFromTaskHeadCommit,
     completionReadyToMergeNotice,
+    inProgressRootIssueIdFromWorkflow,
     normalizeSessionFilePath,
+    parseOriginRemoteUrlFromJjGitRemoteListOutput,
     resolveEditorPrefillValue,
     shouldNotifyPendingTransitionOutsideTaskLoop,
 } from "../index.js";
@@ -21,6 +24,31 @@ test("normalizeSessionFilePath trims and preserves non-empty absolute paths", ()
         normalizeSessionFilePath("  /Users/colin/.pi/agent/sessions/foo.jsonl  "),
         "/Users/colin/.pi/agent/sessions/foo.jsonl",
     );
+});
+
+test("parseOriginRemoteUrlFromJjGitRemoteListOutput extracts origin URL", () => {
+    const output = [
+        "upstream https://github.com/example/upstream.git",
+        "origin git@github.com:owner/repo.git",
+    ].join("\n");
+
+    assert.equal(
+        parseOriginRemoteUrlFromJjGitRemoteListOutput(output),
+        "git@github.com:owner/repo.git",
+    );
+});
+
+test("parseOriginRemoteUrlFromJjGitRemoteListOutput ignores non-origin remotes", () => {
+    const output = "upstream https://github.com/example/upstream.git";
+
+    assert.equal(
+        parseOriginRemoteUrlFromJjGitRemoteListOutput(output),
+        null,
+    );
+});
+
+test("parseOriginRemoteUrlFromJjGitRemoteListOutput returns null for blank input", () => {
+    assert.equal(parseOriginRemoteUrlFromJjGitRemoteListOutput("   \n\t"), null);
 });
 
 test("shouldNotifyPendingTransitionOutsideTaskLoop returns true for replayable unconsumed transition", () => {
@@ -134,5 +162,49 @@ test("resolveEditorPrefillValue singleLine mode uses first non-empty line", () =
     assert.equal(
         resolveEditorPrefillValue("\n\n first-line \n second-line", "default-value", {singleLine: true}),
         "first-line",
+    );
+});
+
+test("buildTaskBranchRevsetFromTaskHeadCommit uses commit_id selectors", () => {
+    assert.equal(
+        buildTaskBranchRevsetFromTaskHeadCommit("abc123"),
+        "(::commit_id(abc123) ~ ::fork_point(commit_id(abc123) | @-)) & ~empty()",
+    );
+});
+
+test("buildTaskBranchRevsetFromTaskHeadCommit trims whitespace", () => {
+    assert.equal(
+        buildTaskBranchRevsetFromTaskHeadCommit("  abc123  \n"),
+        "(::commit_id(abc123) ~ ::fork_point(commit_id(abc123) | @-)) & ~empty()",
+    );
+});
+
+test("inProgressRootIssueIdFromWorkflow returns root issue id for non-complete workflow", () => {
+    assert.equal(
+        inProgressRootIssueIdFromWorkflow({
+            workflowState: "implement",
+            rootTaskId: "123",
+        }),
+        "123",
+    );
+});
+
+test("inProgressRootIssueIdFromWorkflow excludes complete workflow", () => {
+    assert.equal(
+        inProgressRootIssueIdFromWorkflow({
+            workflowState: "complete",
+            rootTaskId: "123",
+        }),
+        null,
+    );
+});
+
+test("inProgressRootIssueIdFromWorkflow rejects invalid issue ids", () => {
+    assert.equal(
+        inProgressRootIssueIdFromWorkflow({
+            workflowState: "review",
+            rootTaskId: "tp-123",
+        }),
+        null,
     );
 });

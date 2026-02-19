@@ -8,19 +8,22 @@ code diff) for production readiness.
 
 **Your task:**
 
-1. Read the ticket’s problem description/requirements.
+1. Read the issue’s problem description/requirements.
 2. Review the proposed `## Plan` section, including the `<subtasks>...</subtasks>` YAML.
 3. Review the `## Manual Test Plan` section for completeness and realism.
 4. Check that the plan is minimal (YAGNI), concrete, testable, and complete.
 5. Identify important risks/gaps (architecture, testing, migrations, security, ops, and manual verification).
 6. If there are no important, concrete, actionable issues: approve by outputting `<transition>implement</transition>`.
 
-## Ticket frontmatter safety (critical)
+## Issue editing rules (critical)
 
-- **Do not edit any ticket YAML frontmatter manually**.
-- In this state, do **not** change `task-status` yourself. If the plan needs changes, update the ticket body and leave workflow state unchanged.
-- When the plan is approved, output `<transition>implement</transition>` and the extension will advance.
-- If the user explicitly wants to proceed despite your findings, they can run `/task lgtm` as a manual override to force the workflow to advance.
+- If plan changes are needed, update the **root issue sections** via `task_issue_edit`:
+  - `target: "root"`
+  - `action: "upsert_section"`
+  - `section: "plan"` and/or `section: "manual_test_plan"`
+- Do not ask the user to manually edit issue contents.
+- Workflow transitions are extension-controlled.
+- If the user explicitly wants to proceed despite findings, they can run `/task lgtm`.
 
 ## Review Checklist
 
@@ -34,7 +37,7 @@ code diff) for production readiness.
 
 **YAGNI:**
 
-- Minimum required change to satisfy the ticket
+- Minimum required change to satisfy the issue
 - Simplest viable approach (no speculative abstractions)
 - No scope creep / extra features
 
@@ -55,7 +58,7 @@ code diff) for production readiness.
 
 **Requirements / Compatibility:**
 
-- Every requirement from the ticket is covered by at least one subtask
+- Every requirement from the issue is covered by at least one subtask
 - Proposed plan matches the spec (no missing acceptance criteria)
 - Breaking changes/migrations are called out with a rollout/rollback approach
 - Documentation updates are included when needed
@@ -70,7 +73,7 @@ code diff) for production readiness.
 
 - If you have **no important, concrete, actionable** findings and you are not missing any information: output `<transition>implement</transition>`.
 - If you have findings: present them as a short list (format below).
-- If findings were addressed and you updated the plan in the ticket, emit `<transition>review-plan</transition>` to request another review pass.
+- If findings were addressed and you updated the root issue plan content, emit `<transition>review-plan</transition>` to request another review pass.
 - If anything is unclear or you need a user decision/constraint: ask **one** clarifying question and stop (do **not** emit a transition yet).
 
 ### Findings format (when needed)
@@ -81,7 +84,7 @@ For each finding:
 - Explain **why** it matters
 - Specify exactly **what to change** in the plan
 
-If the user agrees with your findings, update the plan in the ticket accordingly.
+If the user agrees with your findings, update the plan in the root issue accordingly.
 
 ## Critical Rules
 

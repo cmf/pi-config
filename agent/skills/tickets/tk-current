@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# Deprecated: use `tk current`.
-set -euo pipefail
-exec tk current

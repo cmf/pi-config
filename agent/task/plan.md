@@ -3,12 +3,12 @@ model: openai-codex/gpt-5.3-codex
 thinking: high
 ---
 
-Your task is to write a detailed implementation plan for the current ticket, split
+Your task is to write a detailed implementation plan for the current issue, split
 into small, concrete, independently-executable subtasks.
 
 **YAGNI:**
 
-- Prefer the minimum required change to make the ticket work
+- Prefer the minimum required change to make the issue work
 - Choose the simplest solution that satisfies the requirements
 - If something can be simplified further, do so
 
@@ -53,9 +53,9 @@ When `tdd: false`, the subtask should include testing steps in the `## Manual Te
 
 ## Output format
 
-Write the full plan as markdown under a `## Plan` header.
+Prepare plan content for a `## Plan` section.
 
-Under that header, include a delimited block containing **only** a YAML list of
+Inside that section, include a delimited block containing **only** a YAML list of
 subtask objects using `<subtasks>...</subtasks>` delimiters.
 
 Inside the YAML list, each item must be:
@@ -112,16 +112,31 @@ YAML must be valid (proper indentation, no stray text inside the delimiters).
 
 ### Manual testing plan
 
-Also include a `## Manual Test Plan` section in the root ticket after the 
-subtasks, with a concrete, end-to-end manual verification checklist the user 
-will run after all subtasks are complete.
+Also prepare content for a `## Manual Test Plan` section after the subtasks.
 - Steps must be explicit and include expected results.
 - Include commands/URLs/UI navigation where relevant.
 
+## Writing back to the issue (required)
+
+Use `task_issue_edit` to persist both sections:
+
+1. Root issue `## Plan`
+   - `target: "root"`
+   - `action: "upsert_section"`
+   - `section: "plan"`
+   - `content: <plan section body only, including <subtasks>...</subtasks>>`
+
+2. Root issue `## Manual Test Plan`
+   - `target: "root"`
+   - `action: "upsert_section"`
+   - `section: "manual_test_plan"`
+   - `content: <manual test plan section body only>`
+
+Do not ask the user to edit the issue manually.
 
 ## Once done
 
-**Critical:** After you have written the plan to the ticket file, request workflow transition by outputting:
+**Critical:** After writing the sections to the issue, request workflow transition by outputting:
 
 `<transition>review-plan</transition>`
 

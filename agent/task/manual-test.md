@@ -5,15 +5,19 @@ thinking: high
 
 You are coordinating **manual end-to-end verification** for the root task.
 
-You will be given the full root ticket context (problem + plan) and the current ticket.
+You will be given the full root issue context (problem + plan) and the current issue.
 
 ## Your goals
 
-1. Ensure the root ticket contains a high-quality manual verification checklist under a clear header such as:
+1. Ensure the root issue contains a high-quality manual verification checklist under a clear header such as:
    - `## Manual Test Plan` (preferred)
    - `## Manual Verification`
 
-2. If the checklist is missing or incomplete, update the root ticket to add/improve it.
+2. If the checklist is missing or incomplete, update the root issue to add/improve it using `task_issue_edit`:
+   - For `## Manual Test Plan`:
+     - `target: "root"`, `action: "upsert_section"`, `section: "manual_test_plan"`
+   - For `## Manual Verification`:
+     - `target: "root"`, `action: "upsert_section"`, `section: "manual_verification"`
    - Steps must be concrete, ordered, and include expected results.
    - Include commands, URLs, UI navigation paths, and edge cases where relevant.
 
@@ -35,9 +39,5 @@ ask them to reply with this confirmation phrase:
 
 The extension will detect that explicit user confirmation and advance workflow to `commit`.
 After the user sends the confirmation phrase, tell them to run `/task` again to continue the workflow.
-
-**Critical:**
-- Do **not** edit any ticket YAML frontmatter manually (`--- ... ---`).
-- Do **not** change `status`.
 
 Do not proceed as passed if any manual test fails.

@@ -3,22 +3,22 @@ model: openai-codex/gpt-5.3-codex
 thinking: medium
 ---
 
-You are implementing the **current implement-review ticket**, which is a follow-up finding created from a subtask code review.
+You are implementing the **current implement-review issue**, which is a follow-up finding created from a subtask code review.
 
 You will be given:
 
-- The full parent ticket context (root problem + plan),
-- The parent subtask ticket context, and
-- The current implement-review ticket (title + description)
+- The full parent issue context (root problem + plan),
+- The parent subtask issue context, and
+- The current implement-review issue (title + description)
 
 ## What to implement
 
-- Treat the current ticket’s title/description as the source of truth.
+- Treat the current issue’s title/description as the source of truth.
 - Keep changes minimal and directly address the finding.
 
 ## TDD policy
 
-Default to TDD unless the ticket/plan explicitly exempts this finding (`tdd: false`).
+Default to TDD unless the issue/plan explicitly exempts this finding (`tdd: false`).
 If you cannot determine whether TDD is exempt, ask the user before proceeding without tests.
 
 If TDD applies:
@@ -28,17 +28,24 @@ If TDD applies:
 3. Implement the minimal fix
 4. Re-run the test(s) and ensure they pass
 
-## Ticket frontmatter safety (critical)
+## Issue editing rules (critical)
 
-- **Do not edit any ticket YAML frontmatter manually**.
-- Do **not** change `status` or `task-status`. The extension controls lifecycle and transitions.
+- Use `task_issue_edit` for issue content updates.
+- Do not ask the user to manually edit issue content.
+- Workflow/lifecycle transitions are extension-controlled.
 
-## Ticket hygiene
+## Issue hygiene
 
-- Ensure the current ticket includes/updates a `## Summary of Changes` section.
+- Ensure the active issue includes/updates a `## Summary of Changes` section using:
+  - `target: "active"`
+  - `action: "upsert_section"`
+  - `section: "summary_of_changes"`
 - Record any deviations from the parent plan or unexpected constraints.
-- If this finding changes end-to-end behavior, update the root ticket’s `## Manual Test Plan` accordingly.
+- If this finding changes end-to-end behavior, update root `## Manual Test Plan` using:
+  - `target: "root"`
+  - `action: "upsert_section"`
+  - `section: "manual_test_plan"`
 
 ## Once done
 
-- Leave the ticket ready for re-review of the parent subtask.
+- Leave the issue ready for re-review of the parent subtask.

@@ -5,25 +5,28 @@ thinking: medium
 
 You are finalizing the **root task** after all subtasks have been implemented and committed.
 
-You will be given the root ticket context (problem + plan) and the current ticket.
+You will be given the root issue context (problem + plan) and the current issue.
 
 ## What to do
 
-1. Confirm there are no pending changes besides the final root ticket update:
-   - Ticket updates under `.tickets/` are expected and should remain in the commit.
+1. Confirm there are no pending unrelated working-copy changes:
    - Run: `jj st`
    - Run: `jj diff --git --color=never`
 
-2. Ensure the root ticket is ready to close:
+2. Ensure the root issue is ready to close:
    - Ensure a `## Summary of Changes` section exists and accurately describes what was delivered.
+   - If needed, update it with `task_issue_edit`:
+     - `target: "root"`
+     - `action: "upsert_section"`
+     - `section: "summary_of_changes"`
 
-The extension will close the ticket and create the final task-workspace commit deterministically.
+The extension will close the root issue and create the final task-workspace commit deterministically.
 
-## Ticket frontmatter safety (critical)
+## Issue editing rules (critical)
 
-- **Do not edit any ticket YAML frontmatter manually**.
-- Do **not** change `status` or `task-status`. The extension controls lifecycle and transitions.
-- Do **not** revert/restore ticket files (e.g. `jj restore .tickets/<id>.md`). If you believe a ticket file is corrupted, stop and ask the user for guidance.
+- Use `task_issue_edit` for issue content updates.
+- Do not ask the user to manually edit issue content.
+- Do not perform lifecycle/workflow actions directly; the extension controls transitions.
 
 ## Output
 
@@ -46,7 +49,7 @@ Example:
 Add deterministic task workflow state machine
 
 - Make refine/plan interactive and only auto-advance on state transitions.
-- Create review follow-up tickets deterministically from <review-findings>.
+- Create review follow-up issues deterministically from <review-findings>.
 - Commit via extension using <commit-message> to avoid agent-side failures.
 </commit-message>
 ```

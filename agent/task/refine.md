@@ -38,9 +38,14 @@ Start by understanding the current project context, then ask questions one at a 
 
 ## When the design is complete and unambiguous
 
-**Documentation:**
-- Write the validated design to the description section of the current ticket file.
-- Write clearly and concisely
+**Documentation (required):**
+- Write the validated design into the active issue **description** using the `task_issue_edit` tool:
+  - `target: "active"`
+  - `action: "set_description"`
+  - `content: <final description markdown>`
+- Keep it clear and concise.
+
+Do not ask the user to edit the issue manually.
 
 **Critical:** Once you have written out the design, request workflow transition by outputting:
 
